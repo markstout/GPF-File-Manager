@@ -1,3 +1,8 @@
+# File Manager
+A File Manager for Power Users
+
+See https://markstouttech.com/gpf.html for information and documentation
+
 # GPF File Manager - Change Log
 ## Version 1.7.0 (6-5-2026)
 - Font size in two editors match main app
