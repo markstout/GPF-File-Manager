@@ -4,6 +4,9 @@ A File Manager for Power Users
 See https://markstouttech.com/gpf.html for information and documentation
 
 # GPF File Manager - Change Log
+## Version 1.7.1 (06-13-2026)
+- Add folder to Bookmarks
+- Added "Open" to the right-click context menu to open files per their default system association or internal viewer/editor.
 ## Version 1.7.0 (6-5-2026)
 - Font size in two editors match main app
 - Add "Copy Filename to Clipboard"
