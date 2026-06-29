@@ -1,9 +1,43 @@
-# File Manager
-A File Manager for Power Users
+File Manager is a powerful Windows File management system for coders, vibe coders and other power users.
 
-See https://markstouttech.com/gpf.html for information and documentation
+## Features
+- Three primary areas to the app
+	- Individual folder panes (1 to 4)
+	- Bookmarks of frequently accessed folders
+	- Favorite Apps - a list of frequently used applications
+- Panes can be vertical or grid layout
+- Views : Brief, Detailed and Image
+- Unique field layouts for different views
+- Drag and drop between panes for copy or move
+- Drag and drop files to other applications
+- Immediate access to PowerShell or Command Prompt in a pane's folder
+- Markdown viewer and editor
+- Text file editor
+- Diverse right click file handling
+	- Copy path to clipboard
+	- Copy filename to clipboard
+	- Copy text file contents to clipboard
+	- Add folder to bookmarks
+	- Add executable to Favorite Apps
+	- Send to
+	- Make this folder a Sendto destination
+	- Compress to zip
+	- Uncompress here
+	= Edit in Notepaid
+	= Edit in Notepad++
+	- Edit in user defined editor
+	- File Properties
+	- Cut, Copy, Paste, Delete
+	- Rename
+
+### And it is free
 
 # GPF File Manager - Change Log
+## Version 1.7.2 (06-29-2026)
+- Added Registration/Feedback under Help Menu
+- Opens HTML files to Web Browser
+- User Defined Editor added
+- Added MIT License hyperlink to About Dialog
 ## Version 1.7.1 (06-13-2026)
 - Add folder to Bookmarks
 - Added "Open" to the right-click context menu to open files per their default system association or internal viewer/editor.
