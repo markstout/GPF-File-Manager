@@ -1,5 +1,5 @@
 # Get Productive Fast:  File Manager
-# Version 1.7.1 (06-13-2026)
+# Version 1.7.2 (06-29-2026)
 # Copyright 2025 Mark A. Stout
 # Licensed under MIT License
 # For more information see : https://sites.google.com/view/getproductivefast/file-manager
@@ -8,7 +8,7 @@
 # Variables near start
 APP_NAME = "Get Productive Fast:  File Manager"
 APP_COPYRIGHT = "Copyright 2025 Mark A. Stout"
-APP_VERSION = "Version 1.7.1 (06-13-2026)"
+APP_VERSION = "Version 1.7.2 (06-29-2026)"
 APP_SHORT_NAME = "GPFFileManager"
 
 import sys
@@ -26,6 +26,15 @@ import csv
 import ctypes
 from ctypes import wintypes
 from datetime import datetime
+
+# Set AppUserModelID so Windows treats this process as a distinct desktop application on the taskbar.
+# This enables grouping and drag-and-drop hover-activation of destination apps.
+if sys.platform == 'win32':
+    try:
+        myappid = 'markstout.gpf-filemanager.ongoing.1.0'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception as e:
+        pass
 from pathlib import Path
 import stat
 try:
@@ -1419,6 +1428,7 @@ class MainWindow(QMainWindow):
         
         help_menu = bar.addMenu("Help")
         help_menu.addAction("Search Syntax").triggered.connect(lambda: SearchHelpDialog(self).exec())
+        help_menu.addAction("Register or Feedback    ").triggered.connect(lambda: QDesktopServices.openUrl(QUrl("https://docs.google.com/forms/d/e/1FAIpQLScu-V9vAP-dXKh2TR0sSu2Oqz6Z0MqxNaymGb5S0L6jAohM7A/viewform?usp=header")))
         help_menu.addAction("Change Log").triggered.connect(lambda: ChangeLogDialog(self).exec())
         help_menu.addAction("About").triggered.connect(lambda: AboutDialog(self).exec())
 
@@ -2003,10 +2013,15 @@ class AboutDialog(QDialog):
         layout.addWidget(QLabel(APP_COPYRIGHT, alignment=Qt.AlignmentFlag.AlignCenter))
         
         # --- UPDATED LINK ---
-        link_label = QLabel("<a href='https://sites.google.com/view/getproductivefast/file-manager'>About File Manager</a>")
+        link_label = QLabel("<a href='https://markstouttech.com/gpf.html'>About File Manager</a>")
         link_label.setOpenExternalLinks(True)
         link_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(link_label)
+        
+        mit_label = QLabel("<a href='https://opensource.org/licenses/MIT'>MIT License</a>")
+        mit_label.setOpenExternalLinks(True)
+        mit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(mit_label)
         
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         btns.accepted.connect(self.accept)
@@ -3555,6 +3570,12 @@ class ChangeLogDialog(QDialog):
         else:
             changelog_text = """# GPF File Manager - Change Log
 
+### Version 1.7.2 (06-29-2026)
+- Added Registration/Feedback under Help Menu
+- Opens HTML files to Web Browser
+- User Defined Editor added
+- Added MIT License hyperlink to About Dialog
+
 ### Version 1.7.1 (06-13-2026)
 - Add folder to Bookmarks
 - Added "Open" to the right-click context menu to open files per their default system association or internal viewer/editor.
@@ -4189,6 +4210,41 @@ class BookmarkTree(QTreeWidget):
         if path and self.main.active_pane:
             self.main.active_pane.navigate(path)
 
+    def startDrag(self, supportedActions):
+        items = self.selectedItems()
+        if not items:
+            return
+            
+        paths = []
+        for item in items:
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path and os.path.exists(path):
+                paths.append(path)
+                
+        if not paths:
+            super().startDrag(supportedActions)
+            return
+            
+        mime_data = QMimeData()
+        urls = [QUrl.fromLocalFile(p) for p in paths]
+        mime_data.setUrls(urls)
+        
+        if paths:
+            mime_data.setText(paths[0])
+            
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        
+        try:
+            rect = self.visualItemRect(items[0])
+            pixmap = self.viewport().grab(rect)
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(QPoint(10, 10))
+        except Exception:
+            pass
+            
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.LinkAction, Qt.DropAction.CopyAction)
+
     # [FIX] Missing method added here
     def open_context_menu(self, point):
         item = self.itemAt(point)
@@ -4243,7 +4299,12 @@ class FavoritesTree(QTreeWidget):
         path = item.data(0, Qt.ItemDataRole.UserRole)
         if path and os.path.exists(path):
             try:
-                os.startfile(path)
+                ext = os.path.splitext(path)[1].lower()
+                if ext in ['.html', '.htm']:
+                    import webbrowser
+                    webbrowser.open(Path(path).as_uri())
+                else:
+                    os.startfile(path)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not launch app: {e}")
 
@@ -4281,6 +4342,41 @@ class FavoritesTree(QTreeWidget):
              for i in self.selectedItems():
                  (i.parent() or self.invisibleRootItem()).removeChild(i)
              self.main.save_settings()
+
+    def startDrag(self, supportedActions):
+        items = self.selectedItems()
+        if not items:
+            return
+            
+        paths = []
+        for item in items:
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path and os.path.exists(path):
+                paths.append(path)
+                
+        if not paths:
+            super().startDrag(supportedActions)
+            return
+            
+        mime_data = QMimeData()
+        urls = [QUrl.fromLocalFile(p) for p in paths]
+        mime_data.setUrls(urls)
+        
+        if paths:
+            mime_data.setText(paths[0])
+            
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        
+        try:
+            rect = self.visualItemRect(items[0])
+            pixmap = self.viewport().grab(rect)
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(QPoint(10, 10))
+        except Exception:
+            pass
+            
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.LinkAction, Qt.DropAction.CopyAction)
 
     def dragEnterEvent(self, event):
         
@@ -4415,6 +4511,70 @@ class PathEdit(QLineEdit):
         super().focusOutEvent(event)
         if self.isVisible(): self.pane.toggle_path_edit()
 
+class FileTreeView(QTreeView):
+    def __init__(self, pane):
+        super().__init__()
+        self.pane = pane
+        
+    def startDrag(self, supportedActions):
+        paths = self.pane.get_selected_paths()
+        if not paths:
+            return
+            
+        mime_data = QMimeData()
+        urls = [QUrl.fromLocalFile(p) for p in paths if p]
+        mime_data.setUrls(urls)
+        
+        if paths:
+            mime_data.setText(paths[0])
+            
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        
+        try:
+            indexes = self.selectedIndexes()
+            if indexes:
+                rect = self.visualRect(indexes[0])
+                pixmap = self.viewport().grab(rect)
+                drag.setPixmap(pixmap)
+                drag.setHotSpot(QPoint(10, 10))
+        except Exception:
+            pass
+            
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.LinkAction, Qt.DropAction.CopyAction)
+
+class FileListView(QListView):
+    def __init__(self, pane):
+        super().__init__()
+        self.pane = pane
+        
+    def startDrag(self, supportedActions):
+        paths = self.pane.get_selected_paths()
+        if not paths:
+            return
+            
+        mime_data = QMimeData()
+        urls = [QUrl.fromLocalFile(p) for p in paths if p]
+        mime_data.setUrls(urls)
+        
+        if paths:
+            mime_data.setText(paths[0])
+            
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        
+        try:
+            indexes = self.selectedIndexes()
+            if indexes:
+                rect = self.visualRect(indexes[0])
+                pixmap = self.viewport().grab(rect)
+                drag.setPixmap(pixmap)
+                drag.setHotSpot(QPoint(10, 10))
+        except Exception:
+            pass
+            
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.LinkAction, Qt.DropAction.CopyAction)
+
 class FilePane(QWidget):
     def __init__(self, name, default_path, parent=None):
         super().__init__(parent)
@@ -4517,7 +4677,7 @@ class FilePane(QWidget):
         self.stack = QStackedWidget()
         self.layout.addWidget(self.stack)
         
-        self.tree_view = QTreeView()
+        self.tree_view = FileTreeView(self)
         self.tree_view.setModel(self.model)
         self.tree_view.setRootIndex(self.model.index(default_path))
         self.tree_view.setDragEnabled(True)
@@ -4538,7 +4698,7 @@ class FilePane(QWidget):
                 for i, w in enumerate(saved_widths):
                     self.tree_view.setColumnWidth(i, w)
                     
-        self.list_view = QListView()
+        self.list_view = FileListView(self)
         self.list_view.setModel(self.model)
         self.list_view.setRootIndex(self.model.index(default_path))
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -4555,6 +4715,9 @@ class FilePane(QWidget):
         self.thumbnail_delegate = ThumbnailDelegate(self.list_view)
         self.thumbnail_delegate.set_view(self.list_view)
         self.list_view.setItemDelegate(self.thumbnail_delegate)
+        self.list_view.dragEnterEvent = self.dragEnterEvent
+        self.list_view.dragMoveEvent = self.dragMoveEvent
+        self.list_view.dropEvent = self.dropEvent
         
         self.stack.addWidget(self.tree_view) # Index 0
         self.stack.addWidget(self.list_view) # Index 1
@@ -5022,13 +5185,23 @@ class FilePane(QWidget):
         if os.path.isdir(path):
             self.navigate(path)
         else:
+            # Check if HTML file
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ['.html', '.htm']:
+                import webbrowser
+                try:
+                    webbrowser.open(Path(path).as_uri())
+                    return
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Could not open HTML in default browser:\n{e}")
+                    return
+
             # [NEW] Check if zip file
             if path.lower().endswith('.zip'):
                 self.navigate(path)
                 return
 
             # Check if executable file
-            ext = os.path.splitext(path)[1].lower()
             if ext in ['.exe', '.bat', '.cmd', '.ps1', '.com']:
                 try:
                     work_dir = os.path.dirname(path)
@@ -5364,11 +5537,11 @@ class FilePane(QWidget):
         act_sendto_here = menu.addAction("Create sendto destination to here")
         menu.addSeparator()
         
-        act_custom_edit = None
-        custom_editor = self.window().settings.get("custom_editor_path")
-        if custom_editor and os.path.exists(custom_editor):
-            app_name = os.path.splitext(os.path.basename(custom_editor))[0].title()
-            act_custom_edit = menu.addAction(f"Edit in {app_name}")
+        custom_editor = self.window().settings.get("custom_editor_path", "")
+        is_defined = bool(custom_editor and custom_editor.strip())
+        act_custom_edit = menu.addAction("Edit in User Defined Editor")
+        if not is_defined:
+            act_custom_edit.setEnabled(False)
         
         act_notepad = menu.addAction("Edit in notepad")
         act_notepad_plus = menu.addAction("Edit in notepad++")
@@ -5414,7 +5587,11 @@ class FilePane(QWidget):
         elif action == act_send_desktop: self.window().on_send_to_desktop(path)
         elif action == act_send_docs: self.window().on_send_to_documents(path)
         elif action == act_sendto_here: self.window().on_create_sendto_destination(path)
-        elif act_custom_edit and action == act_custom_edit: safe_launch(custom_editor, arguments=[path])
+        elif act_custom_edit and action == act_custom_edit:
+            try:
+                safe_launch(custom_editor, arguments=[path])
+            except Exception as e:
+                QMessageBox.critical(self.window(), "Error", f"Failed to launch User Defined Editor:\n{e}")
         elif action == act_notepad: safe_launch('notepad.exe', arguments=[path])
         elif action == act_notepad_plus:
              npp_paths = [
@@ -5898,7 +6075,8 @@ class MainWindow(QMainWindow):
 
         help_menu = bar.addMenu("Help")
         # --- UPDATED LINK ---
-        help_menu.addAction("Documentation").triggered.connect(lambda: QDesktopServices.openUrl(QUrl("https://sites.google.com/view/getproductivefast/file-manager/documentation")))
+        help_menu.addAction("Documentation").triggered.connect(lambda: QDesktopServices.openUrl(QUrl("https://markstouttech.com/filemanager.html")))
+        help_menu.addAction("Register or Feedback    ").triggered.connect(lambda: QDesktopServices.openUrl(QUrl("https://docs.google.com/forms/d/e/1FAIpQLScu-V9vAP-dXKh2TR0sSu2Oqz6Z0MqxNaymGb5S0L6jAohM7A/viewform?usp=header")))
         help_menu.addAction("Check for Updates").triggered.connect(lambda: UpdateDialog(self).exec())
         help_menu.addAction("Change Log").triggered.connect(lambda: ChangeLogDialog(self).exec())
         help_menu.addAction("About").triggered.connect(lambda: AboutDialog(self).exec())
