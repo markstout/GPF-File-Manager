@@ -1,20 +1,21 @@
 # Get Productive Fast:  File Manager
-# Version 1.7.2 (06-29-2026)
-# Copyright 2025 Mark A. Stout
+# Version 1.7.3 (10-12-2026)
+# Copyright 2026 Mark A. Stout
 # Licensed under MIT License
 # For more information see : https://sites.google.com/view/getproductivefast/file-manager
 # last working on open with, it is not working.abs
 
 # Variables near start
 APP_NAME = "Get Productive Fast:  File Manager"
-APP_COPYRIGHT = "Copyright 2025 Mark A. Stout"
-APP_VERSION = "Version 1.7.2 (06-29-2026)"
+APP_COPYRIGHT = "Copyright 2026 Mark A. Stout"
+APP_VERSION = "Version 1.7.3 (10-12-2026)"
 APP_SHORT_NAME = "GPFFileManager"
 
 import sys
 import multiprocessing
 import os
 import json
+import re
 import shutil
 import subprocess
 import uuid
@@ -25,7 +26,7 @@ import sqlite3
 import csv
 import ctypes
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Set AppUserModelID so Windows treats this process as a distinct desktop application on the taskbar.
 # This enables grouping and drag-and-drop hover-activation of destination apps.
@@ -86,7 +87,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QStyledItemDelegate, QStyleOptionViewItem, QInputDialog,
                              QTreeWidget, QTreeWidgetItem, QFileIconProvider, QTextEdit, QTextBrowser, 
                              QFileDialog, QSpinBox, QStackedWidget, QStatusBar, QProgressBar,
-                             QWidgetAction)
+                             QWidgetAction, QTabWidget)
 
 from PyQt6.QtCore import (Qt, QSize, QDir, QUrl, QMimeData, QSettings, 
                           QStandardPaths, QPoint, QFileInfo, qInstallMessageHandler,
@@ -96,7 +97,8 @@ from PyQt6.QtCore import (Qt, QSize, QDir, QUrl, QMimeData, QSettings,
 from PyQt6.QtGui import (QAction, QIcon, QDesktopServices, QDrag, QActionGroup, 
                          QColor, QPalette, QPixmap, QFileSystemModel, QImageReader, 
                          QKeySequence, QCursor, QPainter, QImage, QStandardItemModel, 
-                         QStandardItem, QTextDocument, QFont, QFontMetrics)
+                         QStandardItem, QTextDocument, QFont, QFontMetrics,
+                         QSyntaxHighlighter, QTextCharFormat)
 
 # --- PDF Support ---
 try:
@@ -193,6 +195,16 @@ qInstallMessageHandler(qt_message_handler)
 # --- Helper: Metadata Loader ---
 class MetadataLoader:
     _cache = {}
+
+    @staticmethod
+    def clear_cache(path=None):
+        if path:
+            norm = os.path.normpath(path).lower()
+            to_del = [k for k in MetadataLoader._cache if os.path.normpath(k).lower() == norm]
+            for k in to_del:
+                MetadataLoader._cache.pop(k, None)
+        else:
+            MetadataLoader._cache.clear()
 
     @staticmethod
     def get_metadata(path):
@@ -845,9 +857,13 @@ class IndexerWorker(QThread):
 
 # --- Watchdog Event Handler ---
 if HAS_WATCHDOG:
+    class FileSystemWatcherSignals(QObject):
+        file_changed = pyqtSignal(str) # Path that was created, deleted, or modified
+
     class IndexEventHandler(FileSystemEventHandler):
-        def __init__(self, db_path):
+        def __init__(self, db_path, signals=None):
             self.db_path = db_path
+            self.signals = signals
 
         def _get_conn(self):
             return sqlite3.connect(self.db_path, timeout=30)
@@ -868,6 +884,10 @@ if HAS_WATCHDOG:
                 conn.commit()
                 conn.close()
             except: pass
+            if self.signals:
+                try:
+                    self.signals.file_changed.emit(event.src_path)
+                except Exception: pass
 
         def on_deleted(self, event):
             if event.is_directory: return
@@ -880,6 +900,10 @@ if HAS_WATCHDOG:
                 conn.commit()
                 conn.close()
             except: pass
+            if self.signals:
+                try:
+                    self.signals.file_changed.emit(event.src_path)
+                except Exception: pass
 
         def on_moved(self, event):
             if event.is_directory: return
@@ -896,6 +920,11 @@ if HAS_WATCHDOG:
                 conn.commit()
                 conn.close()
             except: pass
+            if self.signals:
+                try:
+                    self.signals.file_changed.emit(event.src_path)
+                    self.signals.file_changed.emit(event.dest_path)
+                except Exception: pass
 
         def on_modified(self, event):
             if event.is_directory: return
@@ -911,11 +940,16 @@ if HAS_WATCHDOG:
                 conn.commit()
                 conn.close()
             except: pass
+            if self.signals:
+                try:
+                    self.signals.file_changed.emit(event.src_path)
+                except Exception: pass
 
     class FileSystemWatcher:
         def __init__(self, db_path):
             self.observer = Observer()
-            self.handler = IndexEventHandler(db_path)
+            self.signals = FileSystemWatcherSignals()
+            self.handler = IndexEventHandler(db_path, self.signals)
             
         def start(self):
             drives = QDir.drives()
@@ -1200,18 +1234,8 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         
-        # Last Scan Label (Left)
-        last_scan_time = self.settings.get("last_scan_time", "Never")
-        self.lbl_last_scan = QLabel(f"Last Scan: {last_scan_time}")
-        self.status_bar.addWidget(self.lbl_last_scan)
-        
-        self.status_bar.addWidget(QLabel(" | "))
-        
-        # Rescan Link (Left)
-        self.lbl_rescan = QLabel("<a href='#'>Scan Now</a>")
-        self.lbl_rescan.setOpenExternalLinks(False)
-        self.lbl_rescan.linkActivated.connect(self.start_rescan)
-        self.status_bar.addWidget(self.lbl_rescan)
+        self.lbl_last_scan = None
+        self.lbl_rescan = None
         
         # Permanent Message (Right)
         self.lbl_perm_status = QLabel("Ready")
@@ -1819,91 +1843,212 @@ class IndexerWorker(QThread):
     def stop(self):
         self.is_running = False
 
-# --- Watchdog Event Handler ---
-if HAS_WATCHDOG:
-    class IndexEventHandler(FileSystemEventHandler):
-        def __init__(self, db_path):
-            self.db_path = db_path
 
-        def _get_conn(self):
-            return sqlite3.connect(self.db_path, timeout=30)
-
-        def on_created(self, event):
-            if event.is_directory: return
-            try:
-                conn = self._get_conn()
-                cursor = conn.cursor()
-                filename = os.path.basename(event.src_path)
-                folder = os.path.dirname(event.src_path)
-                ext = os.path.splitext(filename)[1].lower()
-                stat = os.stat(event.src_path)
-                
-                cursor.execute('''INSERT INTO files (filename, folder_path, extension, size_bytes, modified_ts, created_ts) 
-                                VALUES (?, ?, ?, ?, ?, ?)''', 
-                                (filename, folder, ext, stat.st_size, stat.st_mtime, stat.st_ctime))
-                conn.commit()
-                conn.close()
-            except: pass
-
-        def on_deleted(self, event):
-            if event.is_directory: return
-            try:
-                conn = self._get_conn()
-                cursor = conn.cursor()
-                filename = os.path.basename(event.src_path)
-                folder = os.path.dirname(event.src_path)
-                cursor.execute("DELETE FROM files WHERE filename=? AND folder_path=?", (filename, folder))
-                conn.commit()
-                conn.close()
-            except: pass
 
 
 
 # --- Search Worker (With Advanced Syntax) ---
-class SearchWorker(QThread):
-    results_ready = pyqtSignal(list)
+class WindowsSearchAdapter:
+    CONNECTION_STRING = "Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"
 
-    def __init__(self, db_path, query, ignore_recycle=True):
-        super().__init__()
-        self.db_path = db_path
-        self.query = query
-        self.ignore_recycle = ignore_recycle
-
-    def run(self):
+    @staticmethod
+    def is_windows_indexer_active() -> bool:
+        connection = None
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            cursor = conn.cursor()
+            import win32com.client
+            import pythoncom
+            pythoncom.CoInitialize()
+            connection = win32com.client.Dispatch("ADODB.Connection")
+            connection.Open(WindowsSearchAdapter.CONNECTION_STRING)
+            return True
+        except Exception as e:
+            print(f"Indexer status check failed: {e}")
+            return False
+        finally:
+            if connection and connection.State == 1:
+                connection.Close()
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except:
+                pass
+
+    @classmethod
+    def local_fs_search(cls, search_term: str, folder_scope: str, ignore_recycle: bool = True) -> list:
+        import fnmatch
+        results = []
+        
+        try:
+            import shlex
+            tokens = shlex.split(search_term, posix=True)
+        except ValueError:
+            tokens = search_term.split()
             
-            # Base Query
-            sql = "SELECT filename, folder_path, size_bytes, modified_ts FROM files WHERE 1=1"
+        if not tokens:
+            return []
             
-            # [FIX] Apply Recycle Bin Filter during Search Query
-            if self.ignore_recycle:
-                sql += " AND folder_path NOT LIKE '%$RECYCLE.BIN%'"
+        predicates = []
+        for token in tokens:
+            lower_token = token.lower()
             
-            params = []
+            if lower_token.startswith("ext:") or lower_token.startswith("extension:") or lower_token.startswith("fileextension:"):
+                parts = token.split(":", 1)
+                ext = parts[1].lower()
+                if not ext.startswith("."): ext = "." + ext
+                predicates.append(lambda name, path, size, mtime, e=ext: name.lower().endswith(e))
+                
+            elif lower_token.startswith("name:") or lower_token.startswith("filename:"):
+                parts = token.split(":", 1)
+                pattern = parts[1].lower()
+                if '*' in pattern or '?' in pattern:
+                    predicates.append(lambda name, path, size, mtime, p=pattern: fnmatch.fnmatch(name.lower(), p))
+                else:
+                    predicates.append(lambda name, path, size, mtime, p=pattern: p in name.lower())
+                    
+            elif lower_token.startswith("size:") or lower_token.startswith("filesize:"):
+                parts = lower_token.split(":", 1)
+                val_str = parts[1]
+                operator = "="
+                if val_str.startswith(">"): 
+                    operator = ">"
+                    val_str = val_str[1:]
+                elif val_str.startswith("<"): 
+                    operator = "<"
+                    val_str = val_str[1:]
+                
+                multiplier = 1
+                if val_str.endswith("gb"): multiplier = 1024**3; val_str = val_str[:-2]
+                elif val_str.endswith("mb"): multiplier = 1024**2; val_str = val_str[:-2]
+                elif val_str.endswith("kb"): multiplier = 1024; val_str = val_str[:-2]
+                elif val_str.endswith("b"): val_str = val_str[:-1]
+                
+                try:
+                    size_val = int(float(val_str) * multiplier)
+                    if operator == ">":
+                        predicates.append(lambda name, path, size, mtime, sv=size_val: size > sv)
+                    elif operator == "<":
+                        predicates.append(lambda name, path, size, mtime, sv=size_val: size < sv)
+                    else:
+                        predicates.append(lambda name, path, size, mtime, sv=size_val: size == sv)
+                except ValueError:
+                    pass
+                    
+            elif lower_token.startswith("datemodified:") or lower_token.startswith("modified:") or lower_token.startswith("date:"):
+                parts = token.split(":", 1)
+                val_str = parts[1]
+                operator = "="
+                if val_str.startswith(">"): 
+                    operator = ">"
+                    val_str = val_str[1:]
+                elif val_str.startswith("<"): 
+                    operator = "<"
+                    val_str = val_str[1:]
+                try:
+                    dt = datetime.strptime(val_str, "%Y-%m-%d")
+                    ts_start = dt.timestamp()
+                    ts_end = ts_start + 86400
+                    if operator == ">":
+                        predicates.append(lambda name, path, size, mtime, ts=ts_end: mtime >= ts)
+                    elif operator == "<":
+                        predicates.append(lambda name, path, size, mtime, ts=ts_start: mtime < ts)
+                    else:
+                        predicates.append(lambda name, path, size, mtime, ts_s=ts_start, ts_e=ts_end: ts_s <= mtime < ts_e)
+                except ValueError:
+                    pass
+                    
+            else:
+                pattern = token.lower()
+                if '*' in pattern or '?' in pattern:
+                    predicates.append(lambda name, path, size, mtime, p=pattern: fnmatch.fnmatch(name.lower(), p))
+                else:
+                    predicates.append(lambda name, path, size, mtime, p=pattern: p in name.lower())
+                    
+        count = 0
+        limit = 5000
+        for root, dirs, files in os.walk(folder_scope):
+            if ignore_recycle and "$RECYCLE.BIN" in root:
+                continue
+                
+            for file in files:
+                count += 1
+                if count > limit:
+                    break
+                    
+                full_path = os.path.join(root, file)
+                try:
+                    stat_info = os.stat(full_path)
+                    size = stat_info.st_size
+                    mtime = stat_info.st_mtime
+                except:
+                    size = 0
+                    mtime = 0.0
+                    
+                match = True
+                for pred in predicates:
+                    if not pred(file, full_path, size, mtime):
+                        match = False
+                        break
+                        
+                if match:
+                    results.append((file, root, size, mtime))
+                    
+            if count > limit:
+                break
+                
+        return results
+
+    @classmethod
+    def execute_search(cls, search_term: str, ignore_recycle: bool = True, folder_scope: str = None) -> list:
+        import win32com.client
+        import pythoncom
+        pythoncom.CoInitialize()
+        
+        connection = win32com.client.Dispatch("ADODB.Connection")
+        rs = win32com.client.Dispatch("ADODB.Recordset")
+        
+        results = []
+        try:
+            connection.Open(cls.CONNECTION_STRING)
             
-            # --- Advanced Parsing ---
-            tokens = self.query.split()
+            conditions = []
+            
+            # Apply Recycle Bin Filter during Search Query
+            if ignore_recycle:
+                conditions.append("System.ItemPathDisplay NOT LIKE '%$RECYCLE.BIN%'")
+                
+            # Parse search term using shlex to respect quotes
+            try:
+                import shlex
+                tokens = shlex.split(search_term, posix=True)
+            except ValueError:
+                tokens = search_term.split()
+                
             for token in tokens:
                 lower_token = token.lower()
                 
-                # Extension Filter (ext:jpg)
-                if lower_token.startswith("ext:"):
-                    ext = lower_token.split(":", 1)[1]
+                # Extension Filter (ext:jpg, extension:jpg, fileextension:jpg)
+                if lower_token.startswith("ext:") or lower_token.startswith("extension:") or lower_token.startswith("fileextension:"):
+                    parts = token.split(":", 1)
+                    ext = parts[1]
                     if not ext.startswith("."): ext = "." + ext
-                    sql += " AND extension = ?"
-                    params.append(ext)
+                    ext = ext.replace("'", "''")
+                    conditions.append(f"System.FileExtension = '{ext}'")
                 
-                # Name Force (name:report)
-                elif lower_token.startswith("name:"):
-                    name = token.split(":", 1)[1]
-                    sql += " AND filename LIKE ?"
-                    params.append(f"%{name}%")
+                # Name Force (name:report, filename:report)
+                elif lower_token.startswith("name:") or lower_token.startswith("filename:"):
+                    parts = token.split(":", 1)
+                    name = parts[1]
+                    name = name.replace("'", "''")
+                    if '*' in name or '?' in name:
+                        name_sql = name.replace('*', '%').replace('?', '_')
+                    else:
+                        name_sql = f"%{name}%"
+                    conditions.append(f"System.ItemName LIKE '{name_sql}'")
                     
-                # Size Filter (size:>10MB, size:<500KB)
-                elif lower_token.startswith("size:"):
-                    val_str = lower_token.split(":", 1)[1]
+                # Size Filter (size:>10MB, filesize:>10MB)
+                elif lower_token.startswith("size:") or lower_token.startswith("filesize:"):
+                    parts = lower_token.split(":", 1)
+                    val_str = parts[1]
                     operator = "="
                     if val_str.startswith(">"): 
                         operator = ">"
@@ -1912,7 +2057,6 @@ class SearchWorker(QThread):
                         operator = "<"
                         val_str = val_str[1:]
                     
-                    # Convert units
                     multiplier = 1
                     if val_str.endswith("gb"): multiplier = 1024**3; val_str = val_str[:-2]
                     elif val_str.endswith("mb"): multiplier = 1024**2; val_str = val_str[:-2]
@@ -1920,17 +2064,15 @@ class SearchWorker(QThread):
                     elif val_str.endswith("b"): val_str = val_str[:-1]
                     
                     try:
-                        size_val = float(val_str) * multiplier
-                        sql += f" AND size_bytes {operator} ?"
-                        params.append(size_val)
+                        size_val = int(float(val_str) * multiplier)
+                        conditions.append(f"System.Size {operator} {size_val}")
                     except ValueError:
-                        pass # Ignore invalid size
+                        pass
 
-                # Date Filter (modified:2023-01-01, created:>2022-01-01)
-                elif lower_token.startswith("modified:") or lower_token.startswith("created:"):
-                    is_created = lower_token.startswith("created:")
-                    col = "created_ts" if is_created else "modified_ts"
-                    val_str = token.split(":", 1)[1]
+                # Date Modified Filter (datemodified:2023-01-01, modified:2023-01-01, date:2023-01-01)
+                elif lower_token.startswith("datemodified:") or lower_token.startswith("modified:") or lower_token.startswith("date:"):
+                    parts = token.split(":", 1)
+                    val_str = parts[1]
                     
                     operator = "="
                     if val_str.startswith(">"): 
@@ -1939,40 +2081,151 @@ class SearchWorker(QThread):
                     elif val_str.startswith("<"): 
                         operator = "<"
                         val_str = val_str[1:]
-                        
+                    
+                    val_str = val_str.replace("'", "''")
+                    
                     try:
                         dt = datetime.strptime(val_str, "%Y-%m-%d")
-                        ts = dt.timestamp()
-                        
+                        start_str = dt.strftime("%Y-%m-%d 00:00:00")
+                        end_str = (dt + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
                         if operator == ">":
-                            # > Date means after the END of that date
-                            sql += f" AND {col} > ?"
-                            params.append(ts + 86400)
+                            conditions.append(f"System.DateModified >= '{end_str}'")
                         elif operator == "<":
-                            # < Date means before the START of that date
-                            sql += f" AND {col} < ?"
-                            params.append(ts)
+                            conditions.append(f"System.DateModified < '{start_str}'")
                         else:
-                            # = Date means WITHIN that day
-                            sql += f" AND {col} >= ? AND {col} < ?"
-                            params.append(ts)
-                            params.append(ts + 86400)
+                            conditions.append(f"(System.DateModified >= '{start_str}' AND System.DateModified < '{end_str}')")
                     except ValueError:
-                        pass 
+                        conditions.append(f"System.DateModified {operator} '{val_str}'")
+
+                # Date Created Filter (datecreated:2023-01-01, created:2023-01-01)
+                elif lower_token.startswith("datecreated:") or lower_token.startswith("created:"):
+                    parts = token.split(":", 1)
+                    val_str = parts[1]
+                    
+                    operator = "="
+                    if val_str.startswith(">"): 
+                        operator = ">"
+                        val_str = val_str[1:]
+                    elif val_str.startswith("<"): 
+                        operator = "<"
+                        val_str = val_str[1:]
+                    
+                    val_str = val_str.replace("'", "''")
+                    
+                    try:
+                        dt = datetime.strptime(val_str, "%Y-%m-%d")
+                        start_str = dt.strftime("%Y-%m-%d 00:00:00")
+                        end_str = (dt + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+                        if operator == ">":
+                            conditions.append(f"System.DateCreated >= '{end_str}'")
+                        elif operator == "<":
+                            conditions.append(f"System.DateCreated < '{start_str}'")
+                        else:
+                            conditions.append(f"(System.DateCreated >= '{start_str}' AND System.DateCreated < '{end_str}')")
+                    except ValueError:
+                        conditions.append(f"System.DateCreated {operator} '{val_str}'")
                 
-                # Default: Partial Name Match
+                # Default: Partial Name Match or content match
                 else:
-                    sql += " AND filename LIKE ?"
-                    params.append(f"%{token}%")
+                    sanitized_token = token.replace("'", "''")
+                    if '*' in sanitized_token or '?' in sanitized_token:
+                        token_sql = sanitized_token.replace('*', '%').replace('?', '_')
+                        conditions.append(f"System.ItemName LIKE '{token_sql}'")
+                    else:
+                        conditions.append(f"(System.ItemName LIKE '%{sanitized_token}%' OR CONTAINS(System.Search.Contents, '\"{sanitized_token}\"'))")
             
-            sql += " LIMIT 500"
-            cursor.execute(sql, params)
-            results = cursor.fetchall()
-            conn.close()
+            # Join conditions
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            
+            # Base query
+            query = f"SELECT System.ItemName, System.ItemPathDisplay, System.Size, System.DateModified FROM SystemIndex WHERE {where_clause}"
+            
+            # Append scope
+            if folder_scope and os.path.exists(folder_scope):
+                formatted_scope = folder_scope.replace("\\", "/")
+                query += f" AND SCOPE='file:{formatted_scope}'"
+                
+            query += " ORDER BY System.DateModified DESC"
+            
+            rs.Open(query, connection)
+            while not rs.EOF:
+                name = rs.Fields.Item("System.ItemName").Value
+                path = rs.Fields.Item("System.ItemPathDisplay").Value
+                size = rs.Fields.Item("System.Size").Value
+                modified = rs.Fields.Item("System.DateModified").Value
+                
+                # Format parent folder and file name
+                if path:
+                    folder_path = os.path.dirname(path)
+                    file_name = name or os.path.basename(path)
+                else:
+                    folder_path = ""
+                    file_name = name or ""
+                
+                # Format size
+                size_bytes = 0
+                if size is not None:
+                    try:
+                        size_bytes = int(size)
+                    except:
+                        pass
+                
+                # Format date modified to timestamp
+                mod_ts = 0.0
+                if modified is not None:
+                    try:
+                        mod_ts = float(modified.timestamp())
+                    except:
+                        try:
+                            mod_ts = float(int(modified))
+                        except:
+                            pass
+                
+                results.append((file_name, folder_path, size_bytes, mod_ts))
+                rs.MoveNext()
+                
+        except Exception as e:
+            print(f"[ERROR] Windows Search Query Failed: {e}")
+        finally:
+            try:
+                if rs.State == 1:
+                    rs.Close()
+            except:
+                pass
+            try:
+                if connection.State == 1:
+                    connection.Close()
+            except:
+                pass
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+                
+        if not results and folder_scope and os.path.exists(folder_scope):
+            results = cls.local_fs_search(search_term, folder_scope, ignore_recycle)
+            
+        return results
+
+
+class SearchWorker(QThread):
+    results_ready = pyqtSignal(list)
+
+    def __init__(self, db_path, query, ignore_recycle=True, folder_scope=None):
+        super().__init__()
+        self.db_path = db_path
+        self.query = query
+        self.ignore_recycle = ignore_recycle
+        self.folder_scope = folder_scope
+
+    def run(self):
+        try:
+            results = WindowsSearchAdapter.execute_search(self.query, self.ignore_recycle, self.folder_scope)
             self.results_ready.emit(results)
         except Exception as e:
             print(f"Search Error: {e}")
             self.results_ready.emit([])
+
 
 # --- Dialogs ---
 class LicenseDialog(QDialog):
@@ -1986,6 +2239,11 @@ class LicenseDialog(QDialog):
         lbl = QLabel(f"{APP_NAME}\n\n{APP_COPYRIGHT}\n\nLicensed under MIT License.\n\nDo you accept the license?")
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
+        
+        web_link = QLabel("<a href='https://markstouttech.com/gpf.html'>Website</a>")
+        web_link.setOpenExternalLinks(True)
+        layout.addWidget(web_link)
+        
         link = QLabel("<a href='https://opensource.org/licenses/MIT'>View License</a>")
         link.setOpenExternalLinks(True)
         layout.addWidget(link)
@@ -2225,42 +2483,79 @@ class UpdateDialog(QDialog):
             self.download_worker.wait()
         super().closeEvent(event)
 
-# --- NEW: Search Help Dialog ---
-class SearchHelpDialog(QDialog):
+# --- NEW: About Search Dialog ---
+class AboutSearchDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Search Syntax Cheat Sheet")
-        self.resize(600, 500)
+        self.setWindowTitle("About Search")
+        self.resize(650, 600)
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
             
         layout = QVBoxLayout(self)
         
+        # We check indexing status
+        from filemgr_ongoing import WindowsSearchAdapter
+        indexing_active = WindowsSearchAdapter.is_windows_indexer_active()
+        
+        if indexing_active:
+            status_html = "<p style='color: green; font-weight: bold;'>✅ Status: Windows Search Indexing is active.</p>"
+        else:
+            status_html = (
+                "<p style='color: red; font-weight: bold;'>⚠️ Status: Windows Search Indexing is currently disabled or stopped.</p>"
+                "<p><i>Note: Local searches will automatically fall back to direct file system scanning.</i></p>"
+            )
+            
         text_edit = QTextEdit()
         text_edit.setReadOnly(True)
-        text_edit.setHtml("""
-            <h3>🔍 Search Syntax Cheat Sheet</h3>
-            <p><b>Logic:</b> Terms are combined with <b>AND</b> logic (e.g., <code>report ext:pdf</code>).</p>
-            <table border="1" cellpadding="4" cellspacing="0" width="100%">
-              <tr><th align="left">Filter</th><th align="left">Syntax</th><th align="left">Description</th></tr>
-              <tr><td><b>Extension</b></td><td>ext:jpg</td><td>Finds files with specific extensions.</td></tr>
-              <tr><td><b>Size</b></td><td>size:>500MB</td><td>Units: B, KB, MB, GB. Operators: &gt; (greater), &lt; (less).</td></tr>
-              <tr><td><b>Modified</b></td><td>modified:2025-11-22</td><td>Format: YYYY-MM-DD. Operators: &gt;, &lt;.</td></tr>
-              <tr><td><b>Created</b></td><td>created:2025-01-01</td><td>Format: YYYY-MM-DD. Operators: &gt;, &lt;.</td></tr>
-              <tr><td><b>Exact Name</b></td><td>name:filename</td><td>Forces a filename match (useful for colons).</td></tr>
+        text_edit.setHtml(f"""
+            <h3>🔍 Windows Search Indexing Integration</h3>
+            <p>This file manager leverages the native <b>Windows Search Indexer</b> database to perform near-instantaneous searches across your files and folders.</p>
+            
+            {status_html}
+            
+            <h3>📂 Checking for Exempted / Excluded Folders</h3>
+            <p>If certain files or folders do not appear in your search results, they may be excluded from the Windows Search index. To check or adjust this:</p>
+            <ol>
+              <li>Open the Windows Start Menu, type <b>Indexing Options</b>, and press Enter.</li>
+              <li>In the Indexing Options window, click the <b>Modify</b> button.</li>
+              <li>Check/uncheck folders to include or exclude them from the search catalog.</li>
+              <li>To rebuild the index or configure specific file type extensions, click <b>Advanced</b>.</li>
+            </ol>
+            
+            <hr/>
+            
+            <h3>📝 Search Syntax Cheat Sheet</h3>
+            <p><b>Logic:</b> Terms are combined with <b>AND</b> logic (e.g., <code>report ext:pdf</code>). Use double quotes for terms with spaces (e.g., <code>filename:"my project"</code>).</p>
+            <p><b>Wildcards:</b> Use <code>*</code> to match zero or more characters (e.g., <code>*.jpg</code>) and <code>?</code> to match exactly one character (e.g., <code>report??.txt</code>).</p>
+            
+            <table border="1" cellpadding="5" cellspacing="0" width="100%">
+              <tr bgcolor="#f2f2f2"><th align="left">Filter</th><th align="left">Windows Explorer / AQS Syntax</th><th align="left">Description</th></tr>
+              <tr><td><b>Extension</b></td><td><code>ext:jpg</code> or <code>extension:jpg</code></td><td>Finds files with specific extensions.</td></tr>
+              <tr><td><b>Name</b></td><td><code>name:report</code> or <code>filename:"my report"</code></td><td>Matches part or all of the filename. Supports wildcards and spaces in quotes.</td></tr>
+              <tr><td><b>Size</b></td><td><code>size:>500MB</code> or <code>filesize:&lt;2KB</code></td><td>Units: B, KB, MB, GB. Operators: &gt; (greater), &lt; (less).</td></tr>
+              <tr><td><b>Date Modified</b></td><td><code>datemodified:2025-11-22</code> or <code>modified:&gt;2025-11-22</code></td><td>Format: YYYY-MM-DD. Operators: &gt;, &lt;.</td></tr>
+              <tr><td><b>Date Created</b></td><td><code>datecreated:2025-01-01</code> or <code>created:&lt;2025-01-01</code></td><td>Format: YYYY-MM-DD. Operators: &gt;, &lt;.</td></tr>
             </table>
+            
             <h3>💡 Examples</h3>
             <ul>
-            <li><b>Large Videos:</b> <code>ext:mp4 size:>1GB</code></li>
-            <li><b>Cleanup Temp:</b> <code>ext:tmp size:<1KB</code></li>
-            <li><b>Recent Images:</b> <code>ext:jpg modified:>2025-01-01</code></li>
+              <li><b>Wildcard Match:</b> <code>filename:report*.xlsx</code> or <code>*.pdf</code></li>
+              <li><b>Large Videos:</b> <code>ext:mp4 size:&gt;1GB</code></li>
+              <li><b>Files with Spaces:</b> <code>filename:"monthly report" ext:pdf</code></li>
+              <li><b>Recent Images:</b> <code>extension:jpg datemodified:&gt;2025-01-01</code></li>
             </ul>
         """)
         layout.addWidget(text_edit)
         
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        btns.rejected.connect(self.close)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        btns.accepted.connect(self.accept)
         layout.addWidget(btns)
+
+
+# Alias for compatibility with existing file pane reference
+SearchHelpDialog = AboutSearchDialog
+
 
 class FieldsDialog(QDialog):
     def __init__(self, parent=None):
@@ -3539,6 +3834,1106 @@ class TextEditorDialog(QDialog):
         else:
             event.accept()
 
+# --- Helper: JSON Syntax Highlighter ---
+class JsonSyntaxHighlighter(QSyntaxHighlighter):
+    def __init__(self, parent=None, is_dark=False):
+        super().__init__(parent)
+        self.highlighting_rules = []
+
+        # Key format (JSON property names)
+        key_format = QTextCharFormat()
+        key_format.setForeground(QColor("#9cdcfe" if is_dark else "#0451a5"))
+        key_format.setFontWeight(QFont.Weight.Bold)
+        self.highlighting_rules.append((re.compile(r'"(?:\\.|[^"\\])*"(?=\s*:)'), key_format))
+
+        # String format (JSON string values)
+        string_format = QTextCharFormat()
+        string_format.setForeground(QColor("#ce9178" if is_dark else "#a31515"))
+        self.highlighting_rules.append((re.compile(r':\s*("(?:\\.|[^"\\])*")'), string_format, 1))
+
+        # Number format
+        number_format = QTextCharFormat()
+        number_format.setForeground(QColor("#b5cea8" if is_dark else "#098658"))
+        self.highlighting_rules.append((re.compile(r'\b-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\b'), number_format))
+
+        # Boolean and Null format
+        keyword_format = QTextCharFormat()
+        keyword_format.setForeground(QColor("#569cd6" if is_dark else "#0000ff"))
+        keyword_format.setFontWeight(QFont.Weight.Bold)
+        self.highlighting_rules.append((re.compile(r'\b(?:true|false|null)\b'), keyword_format))
+
+    def highlightBlock(self, text):
+        for rule in self.highlighting_rules:
+            if len(rule) == 2:
+                pattern, fmt = rule
+                group = 0
+            else:
+                pattern, fmt, group = rule
+            for match in pattern.finditer(text):
+                start = match.start(group)
+                length = match.end(group) - start
+                self.setFormat(start, length, fmt)
+
+# --- Helper: Large Text Editor Dialog for JSON strings/values ---
+class JsonLargeTextEditDialog(QDialog):
+    def __init__(self, initial_text="", title="Edit Text", parent=None, is_dark=False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(650, 480)
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.editor = QTextEdit()
+        font = QFont("Consolas")
+        if not font.fromString("Consolas"):
+            font = QFont("Monospace")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setPointSize(10)
+        self.editor.setFont(font)
+        self.editor.setPlainText(initial_text)
+
+        if is_dark:
+            self.editor.setStyleSheet("QTextEdit { background-color: #1e1e1e; color: #d4d4d4; }")
+
+        layout.addWidget(self.editor)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_text(self):
+        return self.editor.toPlainText()
+
+
+# --- Helper: JSON Editor Dialog with Tree and Text capability ---
+class JsonEditorDialog(QDialog):
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.is_modified = False
+
+        # Extract parent settings
+        settings = {}
+        if parent and hasattr(parent.window(), 'settings'):
+            settings = parent.window().settings
+        self.theme = settings.get("theme", "light").lower()
+        self.font_size = settings.get("font_size", 10)
+
+        self.setWindowTitle(f"JSON Editor - {os.path.basename(path)}")
+        self.setMinimumSize(920, 680)
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # --- Top Toolbar ---
+        self.toolbar_layout = QHBoxLayout()
+        self.toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        self.toolbar_layout.setSpacing(6)
+
+        self.btn_format = QPushButton("Format / Prettify")
+        self.btn_format.setToolTip("Format and indent JSON (Ctrl+I)")
+        self.btn_format.setShortcut(QKeySequence("Ctrl+I"))
+        self.btn_format.clicked.connect(self.format_json)
+
+        self.btn_minify = QPushButton("Minify / Compact")
+        self.btn_minify.setToolTip("Remove whitespace and compact JSON")
+        self.btn_minify.clicked.connect(self.minify_json)
+
+        self.btn_validate = QPushButton("Validate")
+        self.btn_validate.setToolTip("Validate JSON syntax")
+        self.btn_validate.clicked.connect(self.validate_json)
+
+        self.toolbar_layout.addWidget(self.btn_format)
+        self.toolbar_layout.addWidget(self.btn_minify)
+        self.toolbar_layout.addWidget(self.btn_validate)
+
+        self.toolbar_layout.addSpacing(12)
+
+        self.btn_cut = QPushButton("Cut")
+        self.btn_copy = QPushButton("Copy")
+        self.btn_paste = QPushButton("Paste")
+        self.btn_find = QPushButton("Find")
+
+        self.btn_cut.setShortcut(QKeySequence("Ctrl+X"))
+        self.btn_copy.setShortcut(QKeySequence("Ctrl+C"))
+        self.btn_paste.setShortcut(QKeySequence("Ctrl+V"))
+        self.btn_find.setShortcut(QKeySequence("Ctrl+F"))
+
+        for btn in [self.btn_cut, self.btn_copy, self.btn_paste, self.btn_find]:
+            self.toolbar_layout.addWidget(btn)
+
+        self.toolbar_layout.addStretch()
+        layout.addLayout(self.toolbar_layout)
+
+        # --- Search Panel ---
+        self.search_panel = QFrame()
+        self.search_panel.setFrameShape(QFrame.Shape.StyledPanel)
+        self.search_panel.hide()
+
+        search_layout = QHBoxLayout(self.search_panel)
+        search_layout.setContentsMargins(6, 4, 6, 4)
+        search_layout.setSpacing(8)
+
+        lbl_search = QLabel("Find:")
+        search_layout.addWidget(lbl_search)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Enter search term...")
+        self.search_input.textChanged.connect(self.on_search_text_changed)
+        self.search_input.returnPressed.connect(self.find_text_next)
+        search_layout.addWidget(self.search_input)
+
+        self.btn_find_prev = QPushButton("Previous")
+        self.btn_find_prev.clicked.connect(self.find_text_prev)
+        self.btn_find_prev.setShortcut(QKeySequence("Shift+F3"))
+        search_layout.addWidget(self.btn_find_prev)
+
+        self.btn_find_next = QPushButton("Next")
+        self.btn_find_next.clicked.connect(self.find_text_next)
+        self.btn_find_next.setShortcut(QKeySequence("F3"))
+        search_layout.addWidget(self.btn_find_next)
+
+        self.lbl_search_status = QLabel("")
+        self.lbl_search_status.setMinimumWidth(80)
+        search_layout.addWidget(self.lbl_search_status)
+
+        btn_search_close = QPushButton("X")
+        btn_search_close.setFlat(True)
+        btn_search_close.setFixedWidth(20)
+        btn_search_close.clicked.connect(self.hide_search_panel)
+        search_layout.addWidget(btn_search_close)
+
+        layout.addWidget(self.search_panel)
+
+        # --- Tab Widget: Source View & Tree View ---
+        self.tabs = QTabWidget()
+
+        # Tab 1: Text Editor
+        editor_widget = QWidget()
+        editor_layout = QVBoxLayout(editor_widget)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.text_editor = QTextEdit()
+        font = QFont("Consolas")
+        if not font.fromString("Consolas"):
+            font = QFont("Monospace")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setPointSize(self.font_size)
+        self.text_editor.setFont(font)
+        try:
+            self.text_editor.setTabStopDistance(QFontMetrics(font).horizontalAdvance(' ') * 4)
+        except AttributeError:
+            self.text_editor.setTabStopWidth(QFontMetrics(font).width(' ') * 4)
+
+        # Attach JSON Syntax Highlighter
+        self.highlighter = JsonSyntaxHighlighter(self.text_editor.document(), is_dark=(self.theme == "dark"))
+        self.text_editor.textChanged.connect(self.on_text_changed)
+
+        editor_layout.addWidget(self.text_editor)
+        self.tabs.addTab(editor_widget, "Code / Source")
+
+        # Tab 2: Tree View
+        tree_widget = QWidget()
+        tree_layout = QVBoxLayout(tree_widget)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_layout.setSpacing(6)
+
+        tree_bar = QHBoxLayout()
+        self.btn_add_entry = QPushButton("Add")
+        self.btn_add_entry.setToolTip("Add a new entry to the selected node or root")
+        self.btn_add_entry.clicked.connect(self.add_tree_entry)
+        self.btn_edit_entry = QPushButton("Edit")
+        self.btn_edit_entry.setToolTip("Edit the selected entry's key and/or value")
+        self.btn_edit_entry.clicked.connect(self.edit_selected_entry)
+        self.btn_delete_entry = QPushButton("Delete")
+        self.btn_delete_entry.setToolTip("Delete the selected entry")
+        self.btn_delete_entry.clicked.connect(self.delete_selected_entry)
+
+        self.btn_expand_all = QPushButton("Expand All")
+        self.btn_collapse_all = QPushButton("Collapse All")
+        self.btn_expand_all.clicked.connect(self.expand_tree)
+        self.btn_collapse_all.clicked.connect(self.collapse_tree)
+
+        tree_bar.addWidget(self.btn_add_entry)
+        tree_bar.addWidget(self.btn_edit_entry)
+        tree_bar.addWidget(self.btn_delete_entry)
+        tree_bar.addSpacing(10)
+        tree_bar.addWidget(self.btn_expand_all)
+        tree_bar.addWidget(self.btn_collapse_all)
+        tree_bar.addStretch()
+        tree_layout.addLayout(tree_bar)
+
+        self.json_tree = QTreeWidget()
+        self.json_tree.setHeaderLabels(["Key / Index", "Type", "Value"])
+        self.json_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.json_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.json_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.json_tree.setColumnWidth(0, 260)
+        self.json_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.json_tree.customContextMenuRequested.connect(self.show_tree_context_menu)
+        self.json_tree.itemDoubleClicked.connect(lambda item, col: self.edit_selected_entry())
+        tree_layout.addWidget(self.json_tree)
+
+        self.tabs.addTab(tree_widget, "Tree View")
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+
+        layout.addWidget(self.tabs)
+
+        # --- Validation & Status Bar ---
+        self.status_bar_layout = QHBoxLayout()
+        self.status_bar_layout.setContentsMargins(2, 2, 2, 2)
+        self.lbl_status = QLabel("Ready")
+        self.status_bar_layout.addWidget(self.lbl_status)
+        self.status_bar_layout.addStretch()
+        layout.addLayout(self.status_bar_layout)
+
+        # --- Bottom Buttons ---
+        bottom_layout = QHBoxLayout()
+        bottom_layout.setContentsMargins(0, 4, 0, 0)
+        bottom_layout.setSpacing(8)
+
+        self.btn_save = QPushButton("Save")
+        self.btn_save_as = QPushButton("Save As...")
+        self.btn_save.setShortcut(QKeySequence("Ctrl+S"))
+        self.btn_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.btn_save.setToolTip("Save changes (Ctrl+S)")
+        self.btn_save_as.setToolTip("Save as a new file (Ctrl+Shift+S)")
+
+        bottom_layout.addWidget(self.btn_save)
+        bottom_layout.addWidget(self.btn_save_as)
+        bottom_layout.addStretch()
+
+        self.btn_close = QPushButton("Close")
+        self.btn_close.setShortcut(QKeySequence("Escape"))
+        self.btn_close.setToolTip("Close editor (Esc)")
+        bottom_layout.addWidget(self.btn_close)
+
+        layout.addLayout(bottom_layout)
+
+        # Connect actions
+        self.btn_cut.clicked.connect(self.text_editor.cut)
+        self.btn_copy.clicked.connect(self.text_editor.copy)
+        self.btn_paste.clicked.connect(self.text_editor.paste)
+        self.btn_find.clicked.connect(self.toggle_search_panel)
+
+        self.btn_save.clicked.connect(self.save_file)
+        self.btn_save_as.clicked.connect(self.save_file_as)
+        self.btn_close.clicked.connect(self.close)
+
+        # Tree selection state
+        self.tree_data = None
+
+        # Apply Theming
+        self.apply_theme()
+
+        # Load JSON file
+        self.load_file()
+
+    def apply_theme(self):
+        if self.theme == "dark":
+            self.setStyleSheet("""
+                QDialog { background-color: #2b2b2b; color: white; }
+                QPushButton { 
+                    background-color: #3c3c3c; 
+                    color: white; 
+                    border: 1px solid #555; 
+                    padding: 6px 12px; 
+                    border-radius: 4px; 
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #505050; border-color: #777; }
+                QPushButton:pressed { background-color: #2c2c2c; }
+                QTextEdit { 
+                    background-color: #1e1e1e; 
+                    color: #e0e0e0; 
+                    border: 1px solid #444; 
+                    border-radius: 4px;
+                    padding: 6px;
+                }
+                QTreeWidget {
+                    background-color: #1e1e1e;
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                    border-radius: 4px;
+                }
+                QTreeWidget::item:selected {
+                    background-color: #264f78;
+                }
+                QHeaderView::section {
+                    background-color: #333;
+                    color: white;
+                    padding: 4px;
+                    border: 1px solid #444;
+                }
+                QTabWidget::pane {
+                    border: 1px solid #444;
+                    background-color: #2b2b2b;
+                }
+                QTabBar::tab {
+                    background: #3c3c3c;
+                    color: #ccc;
+                    padding: 6px 14px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                    margin-right: 2px;
+                }
+                QTabBar::tab:selected {
+                    background: #2b2b2b;
+                    color: white;
+                    font-weight: bold;
+                    border-top: 2px solid #4fc3f7;
+                }
+                QFrame {
+                    background-color: #3c3c3c;
+                    border: 1px solid #555;
+                    border-radius: 4px;
+                }
+                QLabel { color: white; }
+                QLineEdit {
+                    background-color: #1e1e1e;
+                    color: white;
+                    border: 1px solid #555;
+                    border-radius: 4px;
+                    padding: 4px;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QDialog { background-color: #f0f0f0; color: black; }
+                QPushButton { 
+                    background-color: #e0e0e0; 
+                    color: black; 
+                    border: 1px solid #ccc; 
+                    padding: 6px 12px; 
+                    border-radius: 4px; 
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #d0d0d0; border-color: #bbb; }
+                QPushButton:pressed { background-color: #c0c0c0; }
+                QTextEdit { 
+                    background-color: white; 
+                    color: #333333; 
+                    border: 1px solid #ccc; 
+                    border-radius: 4px;
+                    padding: 6px;
+                }
+                QTreeWidget {
+                    background-color: white;
+                    color: #333333;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                }
+                QTreeWidget::item:selected {
+                    background-color: #cce8ff;
+                    color: black;
+                }
+                QHeaderView::section {
+                    background-color: #e8e8e8;
+                    color: black;
+                    padding: 4px;
+                    border: 1px solid #ccc;
+                }
+                QTabWidget::pane {
+                    border: 1px solid #ccc;
+                    background-color: #f0f0f0;
+                }
+                QTabBar::tab {
+                    background: #e0e0e0;
+                    color: #555;
+                    padding: 6px 14px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                    margin-right: 2px;
+                }
+                QTabBar::tab:selected {
+                    background: #ffffff;
+                    color: black;
+                    font-weight: bold;
+                    border-top: 2px solid #0078d7;
+                }
+                QFrame {
+                    background-color: #e0e0e0;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                }
+                QLabel { color: black; }
+                QLineEdit {
+                    background-color: white;
+                    color: black;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    padding: 4px;
+                }
+            """)
+
+    def load_file(self):
+        try:
+            with open(self.path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            self.text_editor.setPlainText(content)
+            self.is_modified = False
+            self.validate_json(silent=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not load file:\n{e}")
+
+    def on_text_changed(self):
+        self.is_modified = True
+
+    def on_tab_changed(self, index):
+        if index == 1: # Switched to Tree View
+            self.populate_tree()
+
+    def populate_tree(self):
+        self.json_tree.clear()
+        content = self.text_editor.toPlainText().strip()
+        if not content:
+            self.tree_data = {}
+            item = QTreeWidgetItem(self.json_tree)
+            item.setText(0, "Root (Empty)")
+            item.setText(1, "Object")
+            item.setText(2, "{}")
+            item.setData(0, Qt.ItemDataRole.UserRole, [])
+            self.lbl_status.setText("Empty JSON.")
+            return
+
+        try:
+            data = json.loads(content)
+        except Exception as e:
+            self.tree_data = None
+            item = QTreeWidgetItem(self.json_tree)
+            item.setText(0, "Invalid JSON")
+            item.setText(1, "Error")
+            item.setText(2, str(e))
+            self.lbl_status.setText(f"JSON Error: {e}")
+            self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+            return
+
+        self.tree_data = data
+        self._build_tree_nodes(self.json_tree.invisibleRootItem(), data, path=[])
+        self.json_tree.expandToDepth(1)
+        self.lbl_status.setText("Tree view updated.")
+        self.lbl_status.setStyleSheet("color: green;")
+
+    def _build_tree_nodes(self, parent_item, data, path=None):
+        if path is None:
+            path = []
+
+        if isinstance(data, dict):
+            for k, v in data.items():
+                item = QTreeWidgetItem(parent_item)
+                item.setText(0, str(k))
+                child_path = path + [k]
+                item.setData(0, Qt.ItemDataRole.UserRole, child_path)
+                if isinstance(v, dict):
+                    item.setText(1, "Object")
+                    item.setText(2, f"{{{len(v)} items}}")
+                    self._build_tree_nodes(item, v, child_path)
+                elif isinstance(v, list):
+                    item.setText(1, "Array")
+                    item.setText(2, f"[{len(v)} items]")
+                    self._build_tree_nodes(item, v, child_path)
+                else:
+                    item.setText(1, type(v).__name__)
+                    item.setText(2, json.dumps(v))
+        elif isinstance(data, list):
+            for i, v in enumerate(data):
+                item = QTreeWidgetItem(parent_item)
+                item.setText(0, f"[{i}]")
+                child_path = path + [i]
+                item.setData(0, Qt.ItemDataRole.UserRole, child_path)
+                if isinstance(v, dict):
+                    item.setText(1, "Object")
+                    item.setText(2, f"{{{len(v)} items}}")
+                    self._build_tree_nodes(item, v, child_path)
+                elif isinstance(v, list):
+                    item.setText(1, "Array")
+                    item.setText(2, f"[{len(v)} items]")
+                    self._build_tree_nodes(item, v, child_path)
+                else:
+                    item.setText(1, type(v).__name__)
+                    item.setText(2, json.dumps(v))
+        else:
+            item = QTreeWidgetItem(parent_item)
+            item.setText(0, "Value")
+            item.setData(0, Qt.ItemDataRole.UserRole, path)
+            item.setText(1, type(data).__name__)
+            item.setText(2, json.dumps(data))
+
+    def _resolve_data_at_path(self, path):
+        curr = self.tree_data
+        for p in path:
+            curr = curr[p]
+        return curr
+
+    def _sync_tree_to_editor(self):
+        try:
+            formatted = json.dumps(self.tree_data, indent=4, ensure_ascii=False)
+            self.text_editor.setPlainText(formatted)
+            self.is_modified = True
+            self.populate_tree()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to sync data:\n{e}")
+
+    def show_tree_context_menu(self, pos):
+        item = self.json_tree.itemAt(pos)
+        menu = QMenu(self)
+
+        act_add = menu.addAction("Add Entry...")
+        act_add.triggered.connect(self.add_tree_entry)
+
+        if item:
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path is not None and len(path) > 0:
+                act_edit = menu.addAction("Edit...")
+                act_edit.triggered.connect(self.edit_selected_entry)
+                act_del = menu.addAction("Delete")
+                act_del.triggered.connect(self.delete_selected_entry)
+            else:
+                act_edit = menu.addAction("Edit...")
+                act_edit.triggered.connect(self.edit_selected_entry)
+
+        menu.exec(self.json_tree.viewport().mapToGlobal(pos))
+
+    def _prompt_value(self, initial_val="", initial_type="String", title="Value"):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg_layout = QVBoxLayout(dlg)
+
+        form = QFormLayout()
+        cb_type = QComboBox()
+        cb_type.addItems(["String", "Number", "Boolean", "Object", "Array", "Null"])
+        if initial_type in ["String", "Number", "Boolean", "Object", "Array", "Null"]:
+            cb_type.setCurrentText(initial_type)
+
+        val_edit = QLineEdit()
+        val_edit.setText(str(initial_val))
+
+        btn_expand_val = QPushButton("...")
+        btn_expand_val.setToolTip("Open larger editor window for long text/paragraphs")
+        btn_expand_val.setFixedWidth(30)
+
+        def open_large_editor():
+            large_dlg = JsonLargeTextEditDialog(
+                initial_text=val_edit.text(),
+                title=f"{title} - Large Editor",
+                parent=dlg,
+                is_dark=(self.theme == "dark")
+            )
+            if large_dlg.exec() == QDialog.DialogCode.Accepted:
+                val_edit.setText(large_dlg.get_text())
+
+        btn_expand_val.clicked.connect(open_large_editor)
+
+        val_layout = QHBoxLayout()
+        val_layout.setContentsMargins(0, 0, 0, 0)
+        val_layout.addWidget(val_edit)
+        val_layout.addWidget(btn_expand_val)
+
+        val_container = QWidget()
+        val_container.setLayout(val_layout)
+
+        cb_bool = QComboBox()
+        cb_bool.addItems(["true", "false"])
+        if str(initial_val).lower() == "true":
+            cb_bool.setCurrentText("true")
+        elif str(initial_val).lower() == "false":
+            cb_bool.setCurrentText("false")
+
+        def on_type_changed(text):
+            if text == "Boolean":
+                val_container.hide()
+                cb_bool.show()
+            elif text in ("Object", "Array", "Null"):
+                val_container.hide()
+                cb_bool.hide()
+            else:
+                val_container.show()
+                cb_bool.hide()
+
+        cb_type.currentTextChanged.connect(on_type_changed)
+        on_type_changed(cb_type.currentText())
+
+        form.addRow("Type:", cb_type)
+        form.addRow("Value:", val_container)
+        form.addRow("", cb_bool)
+        dlg_layout.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        dlg_layout.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None, False
+
+        t = cb_type.currentText()
+        if t == "String":
+            return val_edit.text(), True
+        elif t == "Number":
+            v_str = val_edit.text().strip()
+            try:
+                if "." in v_str or "e" in v_str.lower():
+                    return float(v_str), True
+                return int(v_str), True
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Number", f"'{v_str}' is not a valid number.")
+                return None, False
+        elif t == "Boolean":
+            return (cb_bool.currentText() == "true"), True
+        elif t == "Null":
+            return None, True
+        elif t == "Object":
+            return {}, True
+        elif t == "Array":
+            return [], True
+        return None, False
+
+    def add_tree_entry(self):
+        if self.tree_data is None:
+            QMessageBox.warning(self, "Error", "Cannot add entry to invalid JSON.")
+            return
+
+        item = self.json_tree.currentItem()
+        target_path = None
+        if item:
+            target_path = item.data(0, Qt.ItemDataRole.UserRole)
+
+        # Find target container
+        container = self.tree_data
+        actual_path = []
+        if target_path:
+            try:
+                node = self._resolve_data_at_path(target_path)
+                if isinstance(node, (dict, list)):
+                    container = node
+                    actual_path = list(target_path)
+                else:
+                    # Target is a leaf node, add to its parent container
+                    actual_path = list(target_path[:-1])
+                    container = self._resolve_data_at_path(actual_path)
+            except Exception:
+                container = self.tree_data
+                actual_path = []
+
+        if isinstance(container, dict):
+            key, ok = QInputDialog.getText(self, "Add Entry", "Enter Key Name:")
+            if not ok or not key.strip():
+                return
+            key = key.strip()
+            if key in container:
+                reply = QMessageBox.question(
+                    self, "Key Exists", f"Key '{key}' already exists. Overwrite?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            val, ok = self._prompt_value(title=f"Add Value for '{key}'")
+            if not ok:
+                return
+            container[key] = val
+            self._sync_tree_to_editor()
+            self.lbl_status.setText(f"Added entry '{key}'.")
+            self.lbl_status.setStyleSheet("color: green;")
+
+        elif isinstance(container, list):
+            val, ok = self._prompt_value(title="Add Element to Array")
+            if not ok:
+                return
+            container.append(val)
+            self._sync_tree_to_editor()
+            self.lbl_status.setText(f"Added item to array at index [{len(container) - 1}].")
+            self.lbl_status.setStyleSheet("color: green;")
+        else:
+            QMessageBox.warning(self, "Error", "Top-level item must be an Object or Array to add entries.")
+
+    def edit_selected_entry(self):
+        if self.tree_data is None:
+            return
+        item = self.json_tree.currentItem()
+        if not item:
+            QMessageBox.information(self, "Edit", "Please select an item in the tree to edit.")
+            return
+
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path is None:
+            return
+
+        if len(path) == 0:
+            # Editing root node
+            if isinstance(self.tree_data, (dict, list)):
+                QMessageBox.information(self, "Edit", "Root container structure can be modified by adding or removing items.")
+                return
+            else:
+                curr_type = "String"
+                if isinstance(self.tree_data, bool): curr_type = "Boolean"
+                elif isinstance(self.tree_data, (int, float)): curr_type = "Number"
+                elif self.tree_data is None: curr_type = "Null"
+                new_val, ok = self._prompt_value(initial_val=self.tree_data, initial_type=curr_type, title="Edit Root Value")
+                if ok:
+                    self.tree_data = new_val
+                    self._sync_tree_to_editor()
+            return
+
+        parent_path = path[:-1]
+        key_or_idx = path[-1]
+        parent_container = self._resolve_data_at_path(parent_path) if parent_path else self.tree_data
+
+        if isinstance(parent_container, dict):
+            # Edit dict key & value
+            current_key = str(key_or_idx)
+            current_val = parent_container[current_key]
+
+            # Custom edit dialog with Key and Value
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Edit Entry '{current_key}'")
+            dlg_layout = QVBoxLayout(dlg)
+            form = QFormLayout()
+
+            key_edit = QLineEdit(current_key)
+            form.addRow("Key:", key_edit)
+
+            cb_type = QComboBox()
+            cb_type.addItems(["String", "Number", "Boolean", "Object", "Array", "Null"])
+
+            curr_type = type(current_val).__name__
+            if isinstance(current_val, dict): curr_type = "Object"
+            elif isinstance(current_val, list): curr_type = "Array"
+            elif isinstance(current_val, bool): curr_type = "Boolean"
+            elif isinstance(current_val, (int, float)): curr_type = "Number"
+            elif current_val is None: curr_type = "Null"
+            else: curr_type = "String"
+
+            cb_type.setCurrentText(curr_type)
+
+            val_edit = QLineEdit(str(current_val) if curr_type not in ("Object", "Array", "Null") else "")
+
+            btn_expand_val = QPushButton("...")
+            btn_expand_val.setToolTip("Open larger editor window for long text/paragraphs")
+            btn_expand_val.setFixedWidth(30)
+
+            def open_large_editor():
+                large_dlg = JsonLargeTextEditDialog(
+                    initial_text=val_edit.text(),
+                    title=f"Edit Value - '{current_key}'",
+                    parent=dlg,
+                    is_dark=(self.theme == "dark")
+                )
+                if large_dlg.exec() == QDialog.DialogCode.Accepted:
+                    val_edit.setText(large_dlg.get_text())
+
+            btn_expand_val.clicked.connect(open_large_editor)
+
+            val_layout = QHBoxLayout()
+            val_layout.setContentsMargins(0, 0, 0, 0)
+            val_layout.addWidget(val_edit)
+            val_layout.addWidget(btn_expand_val)
+
+            val_container = QWidget()
+            val_container.setLayout(val_layout)
+
+            cb_bool = QComboBox()
+            cb_bool.addItems(["true", "false"])
+            cb_bool.setCurrentText("true" if current_val is True else "false")
+
+            def on_type_changed(t):
+                if t == "Boolean":
+                    val_container.hide()
+                    cb_bool.show()
+                elif t in ("Object", "Array", "Null"):
+                    val_container.hide()
+                    cb_bool.hide()
+                else:
+                    val_container.show()
+                    cb_bool.hide()
+
+            cb_type.currentTextChanged.connect(on_type_changed)
+            on_type_changed(curr_type)
+
+            form.addRow("Type:", cb_type)
+            form.addRow("Value:", val_container)
+            form.addRow("", cb_bool)
+            dlg_layout.addLayout(form)
+
+            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            dlg_layout.addWidget(btns)
+
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            new_key = key_edit.text().strip()
+            if not new_key:
+                QMessageBox.warning(self, "Invalid Key", "Key name cannot be empty.")
+                return
+
+            selected_type = cb_type.currentText()
+            if selected_type == "String":
+                new_val = val_edit.text()
+            elif selected_type == "Number":
+                v_str = val_edit.text().strip()
+                try:
+                    new_val = float(v_str) if ("." in v_str or "e" in v_str.lower()) else int(v_str)
+                except ValueError:
+                    QMessageBox.warning(self, "Invalid Number", f"'{v_str}' is not a valid number.")
+                    return
+            elif selected_type == "Boolean":
+                new_val = (cb_bool.currentText() == "true")
+            elif selected_type == "Null":
+                new_val = None
+            elif selected_type == "Object":
+                new_val = current_val if isinstance(current_val, dict) else {}
+            elif selected_type == "Array":
+                new_val = current_val if isinstance(current_val, list) else []
+
+            # If key changed, delete old key and preserve insertion position
+            if new_key != current_key:
+                # Reconstruct dict to maintain order
+                new_dict = {}
+                for k, v in parent_container.items():
+                    if k == current_key:
+                        new_dict[new_key] = new_val
+                    else:
+                        new_dict[k] = v
+                if parent_path:
+                    grandparent = self._resolve_data_at_path(parent_path[:-1]) if len(parent_path) > 1 else self.tree_data
+                    grandparent[parent_path[-1]] = new_dict
+                else:
+                    self.tree_data = new_dict
+            else:
+                parent_container[current_key] = new_val
+
+            self._sync_tree_to_editor()
+            self.lbl_status.setText(f"Updated '{new_key}'.")
+            self.lbl_status.setStyleSheet("color: green;")
+
+        elif isinstance(parent_container, list):
+            idx = int(key_or_idx)
+            current_val = parent_container[idx]
+
+            curr_type = type(current_val).__name__
+            if isinstance(current_val, dict): curr_type = "Object"
+            elif isinstance(current_val, list): curr_type = "Array"
+            elif isinstance(current_val, bool): curr_type = "Boolean"
+            elif isinstance(current_val, (int, float)): curr_type = "Number"
+            elif current_val is None: curr_type = "Null"
+            else: curr_type = "String"
+
+            new_val, ok = self._prompt_value(initial_val=current_val, initial_type=curr_type, title=f"Edit Item [{idx}]")
+            if not ok:
+                return
+
+            parent_container[idx] = new_val
+            self._sync_tree_to_editor()
+            self.lbl_status.setText(f"Updated item [{idx}].")
+            self.lbl_status.setStyleSheet("color: green;")
+
+    def delete_selected_entry(self):
+        if self.tree_data is None:
+            return
+        item = self.json_tree.currentItem()
+        if not item:
+            QMessageBox.information(self, "Delete", "Please select an item in the tree to delete.")
+            return
+
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path is None or len(path) == 0:
+            reply = QMessageBox.question(
+                self, "Delete Root", "Are you sure you want to clear the entire JSON content?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.tree_data = {}
+                self._sync_tree_to_editor()
+                self.lbl_status.setText("Cleared JSON content.")
+            return
+
+        parent_path = path[:-1]
+        target_key = path[-1]
+        parent_container = self._resolve_data_at_path(parent_path) if parent_path else self.tree_data
+
+        name_display = f"'{target_key}'" if isinstance(parent_container, dict) else f"index [{target_key}]"
+        reply = QMessageBox.question(
+            self, "Confirm Deletion", f"Are you sure you want to delete {name_display}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if isinstance(parent_container, dict):
+            del parent_container[target_key]
+        elif isinstance(parent_container, list):
+            del parent_container[int(target_key)]
+
+        self._sync_tree_to_editor()
+        self.lbl_status.setText(f"Deleted {name_display}.")
+        self.lbl_status.setStyleSheet("color: green;")
+
+    def expand_tree(self):
+        self.json_tree.expandAll()
+
+    def collapse_tree(self):
+        self.json_tree.collapseAll()
+
+    def format_json(self):
+        content = self.text_editor.toPlainText()
+        try:
+            data = json.loads(content)
+            formatted = json.dumps(data, indent=4, ensure_ascii=False)
+            self.text_editor.setPlainText(formatted)
+            self.lbl_status.setText("JSON formatted successfully.")
+            self.lbl_status.setStyleSheet("color: green;")
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid JSON", f"Cannot format invalid JSON:\n{e}")
+            self.lbl_status.setText(f"Format error: {e}")
+            self.lbl_status.setStyleSheet("color: red;")
+
+    def minify_json(self):
+        content = self.text_editor.toPlainText()
+        try:
+            data = json.loads(content)
+            minified = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+            self.text_editor.setPlainText(minified)
+            self.lbl_status.setText("JSON minified successfully.")
+            self.lbl_status.setStyleSheet("color: green;")
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid JSON", f"Cannot minify invalid JSON:\n{e}")
+            self.lbl_status.setText(f"Minify error: {e}")
+            self.lbl_status.setStyleSheet("color: red;")
+
+    def validate_json(self, silent=False):
+        content = self.text_editor.toPlainText()
+        try:
+            json.loads(content)
+            self.lbl_status.setText("Valid JSON")
+            self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+            if not silent:
+                QMessageBox.information(self, "Validation", "JSON is valid!")
+            return True
+        except Exception as e:
+            self.lbl_status.setText(f"Invalid JSON: {e}")
+            self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+            if not silent:
+                QMessageBox.warning(self, "Validation Error", f"JSON is invalid:\n{e}")
+            return False
+
+    def toggle_search_panel(self):
+        if self.search_panel.isVisible():
+            self.hide_search_panel()
+        else:
+            self.search_panel.show()
+            self.search_input.setFocus()
+            self.search_input.selectAll()
+
+    def hide_search_panel(self):
+        self.search_panel.hide()
+        self.lbl_search_status.setText("")
+        self.text_editor.setFocus()
+
+    def on_search_text_changed(self, text):
+        if not text:
+            self.lbl_search_status.setText("")
+            return
+        self.find_text(forward=True, is_incremental=True)
+
+    def find_text_next(self):
+        self.find_text(forward=True)
+
+    def find_text_prev(self):
+        self.find_text(forward=False)
+
+    def find_text(self, forward=True, is_incremental=False):
+        text = self.search_input.text()
+        if not text:
+            self.lbl_search_status.setText("")
+            return
+
+        flags = QTextDocument.FindFlag(0)
+        if not forward:
+            flags |= QTextDocument.FindFlag.FindBackward
+
+        found = self.text_editor.find(text, flags)
+        if found:
+            self.lbl_search_status.setText("Found")
+            self.lbl_search_status.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            if is_incremental:
+                self.lbl_search_status.setText("Not found")
+                self.lbl_search_status.setStyleSheet("color: red;")
+                return
+
+            cursor = self.text_editor.textCursor()
+            if forward:
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+            else:
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.text_editor.setTextCursor(cursor)
+
+            found = self.text_editor.find(text, flags)
+            if found:
+                self.lbl_search_status.setText("Wrapped")
+                self.lbl_search_status.setStyleSheet("color: green; font-weight: bold;")
+            else:
+                self.lbl_search_status.setText("Not found")
+                self.lbl_search_status.setStyleSheet("color: red;")
+
+    def save_file(self):
+        content = self.text_editor.toPlainText()
+        try:
+            with open(self.path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.is_modified = False
+            self.validate_json(silent=True)
+            QMessageBox.information(self, "Saved", "JSON file saved successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not save file:\n{e}")
+
+    def save_file_as(self):
+        default_name = self.path
+        new_path, _ = QFileDialog.getSaveFileName(
+            self, "Save JSON As", default_name, "JSON Files (*.json);;All Files (*)"
+        )
+        if new_path:
+            content = self.text_editor.toPlainText()
+            try:
+                with open(new_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                self.path = new_path
+                self.setWindowTitle(f"JSON Editor - {os.path.basename(new_path)}")
+                self.is_modified = False
+                self.validate_json(silent=True)
+                QMessageBox.information(self, "Saved", "File saved successfully as new file.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not save file:\n{e}")
+
+    def closeEvent(self, event):
+        if self.is_modified:
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "You have unsaved changes. Do you want to save them before closing?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.save_file()
+                event.accept()
+            elif reply == QMessageBox.StandardButton.No:
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
 class ChangeLogDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3569,6 +4964,12 @@ class ChangeLogDialog(QDialog):
                 changelog_text = f"# Error\nCould not load Change Log file: {e}"
         else:
             changelog_text = """# GPF File Manager - Change Log
+
+### Version 1.7.3 (10-12-2026)
+- Fixed drag & drop issue in Bookmarks and Favorite apps
+- Search was not working - changed how it is implemented. See Help menu, About Search
+- Updates display if a file is updated in another app
+- Edit of a JSON file invokes a json file editor with Code/Source and Tree View (Add/Edit/Delete entries)
 
 ### Version 1.7.2 (06-29-2026)
 - Added Registration/Feedback under Help Menu
@@ -3705,6 +5106,7 @@ class PropertiesPane(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main = main_window
+        self.current_path = None
         
         # --- FIX: Clean single layout initialization ---
         self.layout = QVBoxLayout(self)
@@ -3725,6 +5127,7 @@ class PropertiesPane(QWidget):
         self.clear_data()
         
     def clear_data(self):
+        self.current_path = None
         while self.form_layout.count():
             item = self.form_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -3734,6 +5137,7 @@ class PropertiesPane(QWidget):
         if not path or not os.path.exists(path):
             self.clear_data()
             return
+        self.current_path = path
         while self.form_layout.count():
             item = self.form_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -4181,6 +5585,56 @@ class BookmarkTree(QTreeWidget):
             super().dragMoveEvent(event)
 
     def dropEvent(self, event):
+        # Handle Internal Reordering first to prevent duplication
+        if event.source() == self:
+            dragged_items = self.selectedItems()
+            if not dragged_items:
+                event.ignore()
+                return
+            dragged_item = dragged_items[0]
+            
+            target_item = self.itemAt(event.position().toPoint())
+            drop_pos = self.dropIndicatorPosition()
+            
+            new_parent = self.invisibleRootItem()
+            insert_idx = -1
+            
+            if target_item:
+                is_folder = (target_item.data(0, Qt.ItemDataRole.UserRole) is None)
+                if drop_pos == QAbstractItemView.DropIndicatorPosition.OnItem:
+                    if is_folder:
+                        new_parent = target_item
+                        insert_idx = -1
+                    else:
+                        new_parent = target_item.parent() or self.invisibleRootItem()
+                        insert_idx = new_parent.indexOfChild(target_item)
+                elif drop_pos == QAbstractItemView.DropIndicatorPosition.AboveItem:
+                    new_parent = target_item.parent() or self.invisibleRootItem()
+                    insert_idx = new_parent.indexOfChild(target_item)
+                elif drop_pos == QAbstractItemView.DropIndicatorPosition.BelowItem:
+                    new_parent = target_item.parent() or self.invisibleRootItem()
+                    insert_idx = new_parent.indexOfChild(target_item) + 1
+            
+            curr = new_parent
+            while curr:
+                if curr == dragged_item:
+                    event.ignore()
+                    return
+                curr = curr.parent()
+                
+            old_parent = dragged_item.parent() or self.invisibleRootItem()
+            old_parent.removeChild(dragged_item)
+            
+            if insert_idx >= 0:
+                new_parent.insertChild(insert_idx, dragged_item)
+            else:
+                new_parent.addChild(dragged_item)
+                
+            self.setCurrentItem(dragged_item)
+            self.main.save_settings()
+            event.accept()
+            return
+
         # Handle External Drops (Files/Folders)
         if event.mimeData().hasUrls():
             target_item = self.itemAt(event.position().toPoint())
@@ -4200,7 +5654,7 @@ class BookmarkTree(QTreeWidget):
                 self.main.add_bookmark_item(os.path.basename(path), path, target_item)
             event.accept()
             
-        # Handle Internal Reordering
+        # Handle Internal Reordering (Fallback)
         else:
             super().dropEvent(event)
             self.main.save_settings()
@@ -4273,6 +5727,7 @@ class BookmarkTree(QTreeWidget):
                  folder_item.setData(0, Qt.ItemDataRole.UserRole, None)
                  folder_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
                  folder_item.setExpanded(True)
+                 folder_item.setFlags(folder_item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
                  self.main.save_settings()
         elif res == act_del and item:
              (item.parent() or self.invisibleRootItem()).removeChild(item)
@@ -4389,6 +5844,60 @@ class FavoritesTree(QTreeWidget):
         elif event.mimeData().hasUrls(): event.accept()
         else: super().dragMoveEvent(event)
     def dropEvent(self, event):
+        # Handle Internal Reordering first to prevent duplication
+        if event.source() == self:
+            dragged_items = self.selectedItems()
+            if not dragged_items:
+                event.ignore()
+                return
+            
+            target_item = self.itemAt(event.position().toPoint())
+            drop_pos = self.dropIndicatorPosition()
+            
+            new_parent = self.invisibleRootItem()
+            insert_idx = -1
+            
+            if target_item:
+                is_folder = (target_item.data(0, Qt.ItemDataRole.UserRole) is None)
+                if drop_pos == QAbstractItemView.DropIndicatorPosition.OnItem:
+                    if is_folder:
+                        new_parent = target_item
+                        insert_idx = -1
+                    else:
+                        new_parent = target_item.parent() or self.invisibleRootItem()
+                        insert_idx = new_parent.indexOfChild(target_item)
+                elif drop_pos == QAbstractItemView.DropIndicatorPosition.AboveItem:
+                    new_parent = target_item.parent() or self.invisibleRootItem()
+                    insert_idx = new_parent.indexOfChild(target_item)
+                elif drop_pos == QAbstractItemView.DropIndicatorPosition.BelowItem:
+                    new_parent = target_item.parent() or self.invisibleRootItem()
+                    insert_idx = new_parent.indexOfChild(target_item) + 1
+            
+            for item in dragged_items:
+                curr = new_parent
+                while curr:
+                    if curr == item:
+                        event.ignore()
+                        return
+                    curr = curr.parent()
+            
+            for item in dragged_items:
+                old_parent = item.parent() or self.invisibleRootItem()
+                if old_parent == new_parent and insert_idx >= 0:
+                    old_idx = old_parent.indexOfChild(item)
+                    if old_idx < insert_idx:
+                        insert_idx -= 1
+                
+                old_parent.removeChild(item)
+                if insert_idx >= 0:
+                    new_parent.insertChild(insert_idx, item)
+                    insert_idx += 1
+                else:
+                    new_parent.addChild(item)
+                    
+            self.main.save_settings()
+            event.accept()
+            return
         
         if event.mimeData().hasFormat("application/x-filemanager-pane-path"):
             path_bytes = event.mimeData().data("application/x-filemanager-pane-path")
@@ -4651,6 +6160,18 @@ class FilePane(QWidget):
         self.btn_search_help.setToolTip("Search Syntax Help")
         self.btn_search_help.clicked.connect(self.show_search_help)
         
+        # Check if indexing is available and hide if not
+        is_indexing_available = True
+        if parent:
+            if hasattr(parent, 'IS_INDEXING_AVAILABLE'):
+                is_indexing_available = parent.IS_INDEXING_AVAILABLE
+            elif hasattr(parent, 'main_window') and hasattr(parent.main_window, 'IS_INDEXING_AVAILABLE'):
+                is_indexing_available = parent.main_window.IS_INDEXING_AVAILABLE
+        
+        if not is_indexing_available:
+            self.search_edit.hide()
+            self.btn_search_help.hide()
+            
         nav_layout.addWidget(self.search_edit)
         nav_layout.addWidget(self.btn_search_help)
         
@@ -5232,7 +6753,10 @@ class FilePane(QWidget):
                     is_txt = False
                     
             if use_internal_txt and is_txt:
-                TextEditorDialog(path, self.window()).exec()
+                if ext == '.json':
+                    JsonEditorDialog(path, self.window()).exec()
+                else:
+                    TextEditorDialog(path, self.window()).exec()
                 return
 
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -5578,7 +7102,10 @@ class FilePane(QWidget):
         elif action == act_view_md:
              MarkdownViewerDialog(path, self.window()).exec()
         elif act_edit and action == act_edit:
-             TextEditorDialog(path, self.window()).exec()
+             if path.lower().endswith('.json'):
+                 JsonEditorDialog(path, self.window()).exec()
+             else:
+                 TextEditorDialog(path, self.window()).exec()
         elif action == act_unzip_here: self.window().run_threaded_io("unzip", [path], os.path.dirname(path))
         elif action == act_unzip_folder:
              folder_name = os.path.splitext(os.path.basename(path))[0]
@@ -5638,6 +7165,29 @@ class FilePane(QWidget):
         self.btn_ps.updateGeometry()
         self.btn_cmd.updateGeometry()
 
+    def refresh_view(self):
+        """Refreshes the file view, directory model cache, and icon thumbnails."""
+        try:
+            if not self.current_path or '|' in self.current_path:
+                return
+            if self.current_path == "sys:this_pc":
+                self.show_this_pc()
+                return
+
+            if isinstance(self.model, DetailedFileSystemModel):
+                # Invalidate directory cache so new/changed files and modified timestamps update immediately
+                idx = self.model.index(self.current_path)
+                if idx.isValid():
+                    self.model.setRootPath("")
+                    self.model.setRootPath(self.current_path)
+                    self.tree_view.setRootIndex(idx)
+                    self.list_view.setRootIndex(idx)
+                    self.model.layoutChanged.emit()
+            elif isinstance(self.tree_view.model(), ZipExplorationModel):
+                pass
+        except Exception as e:
+            log_debug(f"Error in FilePane.refresh_view: {e}")
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5647,6 +7197,7 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(ICON_PATH))
             
         self.settings_mgr = SettingsManager()
+        self.db_mgr = DatabaseManager(self.settings_mgr.db_path)
         
         # --- FIX: Check if file exists BEFORE loading so we can show license ---
         loaded_data = self.settings_mgr.load()
@@ -5702,7 +7253,10 @@ class MainWindow(QMainWindow):
         
         # [NEW] Apply theme and font size on startup
         self.set_theme(self.settings.get("theme", "light"))
-        
+        # Check Windows Search Indexer status on startup
+        self.IS_INDEXING_AVAILABLE = WindowsSearchAdapter.is_windows_indexer_active()
+        log_debug(f"Windows Search Indexer Active: {self.IS_INDEXING_AVAILABLE}")
+
         self.resize(800, 600)
         
         self.set_layout_mode(self.settings.get("layout_mode", "2-vert"))
@@ -5712,9 +7266,17 @@ class MainWindow(QMainWindow):
              self.resizeDocks([self.bookmark_dock], [bm_width], Qt.Orientation.Horizontal)
 
         # --- Start Indexer and Watcher ---
+        self._pending_fs_paths = set()
+        self._fs_refresh_timer = QTimer(self)
+        self._fs_refresh_timer.setSingleShot(True)
+        self._fs_refresh_timer.setInterval(300) # 300ms debounce
+        self._fs_refresh_timer.timeout.connect(self._process_fs_changes)
+
         if HAS_WATCHDOG:
             self.watcher = QFileSystemModel(self) # Dummy
             self.fs_watcher = FileSystemWatcher(self.settings_mgr.db_path)
+            if hasattr(self.fs_watcher, 'signals'):
+                self.fs_watcher.signals.file_changed.connect(self.on_file_system_change)
             try:
                 self.fs_watcher.start()
             except Exception as e:
@@ -5724,6 +7286,7 @@ class MainWindow(QMainWindow):
         self.indexer = IndexerWorker(self.settings_mgr.db_path, self.settings.get("ignore_recycle_bin", True))
         self.indexer.progress_signal.connect(self.on_scan_progress)
         self.indexer.finished_signal.connect(self.on_scan_finished)
+        self.indexer.error_signal.connect(self.on_scan_error)
         
         self.start_drive_monitoring()
     def get_special_folder(self, csidl):
@@ -5753,12 +7316,29 @@ class MainWindow(QMainWindow):
         if not path: return
         # Allow shell: paths even if they don't exist on disk (virtual folders)
         if not os.path.exists(path) and not path.startswith("shell:"): return
-        # --- FIX: Use QTreeWidgetItem instead of QListWidgetItem ---
-        root = parent if parent else self.bookmark_tree.invisibleRootItem()
-        item = QTreeWidgetItem(root)
+        
+        root = self.bookmark_tree.invisibleRootItem()
+        index = -1
+        
+        if parent:
+            is_folder = (parent.data(0, Qt.ItemDataRole.UserRole) is None)
+            if is_folder:
+                root = parent
+            else:
+                root = parent.parent() or self.bookmark_tree.invisibleRootItem()
+                index = root.indexOfChild(parent)
+                
+        item = QTreeWidgetItem()
         item.setText(0, name)
         item.setData(0, Qt.ItemDataRole.UserRole, path)
         item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+        
+        if index >= 0:
+            root.insertChild(index, item)
+        else:
+            root.addChild(item)
+            
         self.save_settings()
         return item
 
@@ -5796,12 +7376,14 @@ class MainWindow(QMainWindow):
                     sub_item.setText(0, name)
                     sub_item.setData(0, Qt.ItemDataRole.UserRole, path)
                     sub_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+                    sub_item.setFlags(sub_item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
             return
         
         # Not found, create it at the top
         system_item = QTreeWidgetItem()
         system_item.setText(0, "System")
         system_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+        system_item.setFlags(system_item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
         # No UserRole data means it's a structural folder
         
         for name, path in system_defaults:
@@ -5809,6 +7391,7 @@ class MainWindow(QMainWindow):
             sub_item.setText(0, name)
             sub_item.setData(0, Qt.ItemDataRole.UserRole, path)
             sub_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+            sub_item.setFlags(sub_item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
         
         system_item.setExpanded(False)
         root.insertChild(0, system_item)
@@ -5816,8 +7399,19 @@ class MainWindow(QMainWindow):
     def add_favorite_item(self, path, parent_item=None):
         if not self.fav_tree: return
         name = os.path.basename(path)
-        root = parent_item if parent_item else self.fav_tree.invisibleRootItem()
-        item = QTreeWidgetItem(root)
+        
+        root = self.fav_tree.invisibleRootItem()
+        index = -1
+        
+        if parent_item:
+            is_folder = (parent_item.data(0, Qt.ItemDataRole.UserRole) is None)
+            if is_folder:
+                root = parent_item
+            else:
+                root = parent_item.parent() or self.fav_tree.invisibleRootItem()
+                index = root.indexOfChild(parent_item)
+                
+        item = QTreeWidgetItem()
         item.setText(0, name)
         item.setData(0, Qt.ItemDataRole.UserRole, path)
         
@@ -5825,16 +7419,43 @@ class MainWindow(QMainWindow):
             item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
         else:
             item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+            
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+        
+        if index >= 0:
+            root.insertChild(index, item)
+        else:
+            root.addChild(item)
+            
         self.save_settings()
+        return item
 
     def add_favorite_group(self, name, parent_item=None):
         if not self.fav_tree: return
-        root = parent_item if parent_item else self.fav_tree.invisibleRootItem()
-        item = QTreeWidgetItem(root)
+        
+        root = self.fav_tree.invisibleRootItem()
+        index = -1
+        
+        if parent_item:
+            is_folder = (parent_item.data(0, Qt.ItemDataRole.UserRole) is None)
+            if is_folder:
+                root = parent_item
+            else:
+                root = parent_item.parent() or self.fav_tree.invisibleRootItem()
+                index = root.indexOfChild(parent_item)
+                
+        item = QTreeWidgetItem()
         item.setText(0, name)
         item.setData(0, Qt.ItemDataRole.UserRole, None)
         item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
         item.setExpanded(True)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
+        
+        if index >= 0:
+            root.insertChild(index, item)
+        else:
+            root.addChild(item)
+            
         self.save_settings()
         return item
             
@@ -5848,32 +7469,30 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         
-        # Last Scan Label (Left)
-        last_scan_time = self.settings.get("last_scan_time", "Never")
-        self.lbl_last_scan = QLabel(f"Last Scan: {last_scan_time}")
-        self.status_bar.addWidget(self.lbl_last_scan)
-        
-        self.status_bar.addWidget(QLabel(" | "))
-        
-        # Rescan Link (Left)
-        self.lbl_rescan = QLabel("<a href='#'>Scan Now</a>")
-        self.lbl_rescan.setOpenExternalLinks(False)
-        self.lbl_rescan.linkActivated.connect(self.start_rescan)
-        self.status_bar.addWidget(self.lbl_rescan)
+        self.lbl_last_scan = None
+        self.lbl_rescan = None
 
     def start_rescan(self):
         if not self.indexer.isRunning():
-            self.lbl_last_scan.setText("Scanning...")
+            if self.lbl_last_scan:
+                self.lbl_last_scan.setText("Scanning... | ")
             self.indexer.start()
 
     def on_scan_progress(self, count):
-        self.lbl_last_scan.setText(f"Scanning... ({count} indexed)")
+        if self.lbl_last_scan:
+            self.lbl_last_scan.setText(f"Scanning... ({count} indexed) | ")
 
     def on_scan_finished(self):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.lbl_last_scan.setText(f"Last Scan: {now}")
+        if self.lbl_last_scan:
+            self.lbl_last_scan.setText("")
         self.settings["last_scan_time"] = now
         self.settings_mgr.save(self.settings)
+
+    def on_scan_error(self, err_msg):
+        log_debug(f"Indexer error: {err_msg}")
+        if self.lbl_last_scan:
+            self.lbl_last_scan.setText("Scan Failed | ")
 
     def setup_sidebar(self):
         dock = QDockWidget("Bookmarks", self)
@@ -5927,6 +7546,7 @@ class MainWindow(QMainWindow):
         pc_item.setText(0, "This PC")
         pc_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
         pc_item.setData(0, Qt.ItemDataRole.UserRole, "sys:this_pc")
+        pc_item.setFlags(pc_item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
 
         defaults = [
             ("Desktop", QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)),
@@ -5949,15 +7569,17 @@ class MainWindow(QMainWindow):
                  
                  # [FIX] Collapse "System", expand others by default
                  if entry["name"] == "System":
-                     item.setExpanded(False)
+                      item.setExpanded(False)
                  else:
-                     item.setExpanded(True)
-                     
+                      item.setExpanded(True)
+                      
                  if "children" in entry: self.load_bookmarks_recursive(entry["children"], item)
+                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
             else:
                  path = entry.get("path", "")
                  item.setData(0, Qt.ItemDataRole.UserRole, path)
                  item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
 
     def load_favorites_recursive(self, data_list, parent_item):
         for entry in data_list:
@@ -5967,19 +7589,22 @@ class MainWindow(QMainWindow):
                 item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
                 item.setExpanded(False) # Collapsed on startup
                 if "children" in entry: self.load_favorites_recursive(entry["children"], item)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
             else:
                 path = entry.get("path", "")
                 item.setData(0, Qt.ItemDataRole.UserRole, path)
                 info = QFileInfo(path)
                 if info.exists():
                     if info.isDir():
-                        QTreeWidgetItem(item)
+                        dummy = QTreeWidgetItem(item)
+                        dummy.setFlags(dummy.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
                         icon_prov = QFileIconProvider()
                         item.setIcon(0, icon_prov.icon(info))
                     else:
                         icon_prov = QFileIconProvider()
                         item.setIcon(0, icon_prov.icon(info))
                 else: item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
 
     # --- NEW: Direct Action for Menu ---
     def action_add_bookmark(self):
@@ -6005,7 +7630,6 @@ class MainWindow(QMainWindow):
         act_new_folder = file_menu.addAction("New Folder")
         act_new_folder.setShortcut("Ctrl+Shift+N")
         act_new_folder.triggered.connect(self.new_folder)
-        
         file_menu.addSeparator()
         file_menu.addAction("Add Bookmark").triggered.connect(self.action_add_bookmark) 
         file_menu.addAction("Exit").triggered.connect(self.close)
@@ -6079,6 +7703,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction("Register or Feedback    ").triggered.connect(lambda: QDesktopServices.openUrl(QUrl("https://docs.google.com/forms/d/e/1FAIpQLScu-V9vAP-dXKh2TR0sSu2Oqz6Z0MqxNaymGb5S0L6jAohM7A/viewform?usp=header")))
         help_menu.addAction("Check for Updates").triggered.connect(lambda: UpdateDialog(self).exec())
         help_menu.addAction("Change Log").triggered.connect(lambda: ChangeLogDialog(self).exec())
+        help_menu.addAction("About Search").triggered.connect(lambda: AboutSearchDialog(self).exec())
         help_menu.addAction("About").triggered.connect(lambda: AboutDialog(self).exec())
 
     def on_export_csv(self):
@@ -6302,6 +7927,49 @@ class MainWindow(QMainWindow):
             elif pane.current_view_mode == "Images":
                 self.act_img.setChecked(True)
 
+    def on_file_system_change(self, path):
+        """Slot called whenever an external or internal file change occurs."""
+        try:
+            if not path:
+                return
+            norm = os.path.normcase(os.path.normpath(path))
+            self._pending_fs_paths.add(norm)
+            # Debounce rapid notifications (e.g. multi-file writes or stream flushes)
+            self._fs_refresh_timer.start()
+        except Exception:
+            pass
+
+    def _process_fs_changes(self):
+        """Debounced processor that updates visible panes and the properties pane."""
+        try:
+            changed_paths = list(self._pending_fs_paths)
+            self._pending_fs_paths.clear()
+            if not changed_paths:
+                return
+
+            # Invalidate MetadataLoader cache for changed files
+            for p in changed_paths:
+                MetadataLoader.clear_cache(p)
+
+            # Determine affected directories
+            affected_dirs = {os.path.dirname(p) for p in changed_paths}
+
+            # Refresh panes currently viewing any affected directory
+            for pane in self.panes:
+                if not pane or not pane.current_path:
+                    continue
+                pane_dir = os.path.normcase(os.path.normpath(pane.current_path))
+                if pane_dir in affected_dirs or any(p.startswith(pane_dir) for p in changed_paths):
+                    pane.refresh_view()
+
+            # Refresh Properties Pane if the currently inspected file was modified
+            if self.props_pane and self.props_pane.isVisible() and self.props_pane.current_path:
+                props_norm = os.path.normcase(os.path.normpath(self.props_pane.current_path))
+                if props_norm in changed_paths:
+                    self.props_pane.update_data(self.props_pane.current_path)
+        except Exception as e:
+            log_debug(f"Error processing file system changes: {e}")
+
     def update_properties(self, path):
         if not path or '|' in path: return # Skip virtual zip paths
         if self.props_pane and self.props_pane.isVisible():
@@ -6381,7 +8049,11 @@ class MainWindow(QMainWindow):
                 print(f"Redo Error: {e}")
             
     def start_search(self, query, pane):
-        self.worker_search = SearchWorker(self.settings_mgr.db_path, query, self.settings.get("ignore_recycle_bin", True))
+        folder_scope = None
+        if pane.current_path and os.path.exists(pane.current_path):
+            folder_scope = pane.current_path
+            
+        self.worker_search = SearchWorker(self.settings_mgr.db_path, query, self.settings.get("ignore_recycle_bin", True), folder_scope=folder_scope)
         self.worker_search.results_ready.connect(pane.display_search_results)
         self.worker_search.start()
         
